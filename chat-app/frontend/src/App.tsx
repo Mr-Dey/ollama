@@ -71,14 +71,14 @@ type View = 'chat' | 'cluster' | 'models';
 // ─── Seed Data ────────────────────────────────────────────────────────────────
 
 const SEED_THREADS: Thread[] = [
-  { id: 't1', title: 'Refactor server.js to stream SSE',        model: 'llama3.1:8b', time: '14:02',     group: 'Today',     messages: [] },
-  { id: 't2', title: 'Diagnose mt4lz pod CrashLoopBackoff',     model: 'llama3.1:8b', time: '11:48',     group: 'Today',     messages: [] },
-  { id: 't3', title: 'Describe the architecture diagram',       model: 'llava:13b',   time: '09:15',     group: 'Today',     messages: [] },
-  { id: 't4', title: 'Summarize plan.md deployment phases',     model: 'llama3.1:8b', time: 'Yesterday', group: 'Yesterday', messages: [] },
+  { id: 't1', title: 'Refactor server.js to stream SSE',        model: 'llama3:8b', time: '14:02',     group: 'Today',     messages: [] },
+  { id: 't2', title: 'Diagnose mt4lz pod CrashLoopBackoff',     model: 'llama3:8b', time: '11:48',     group: 'Today',     messages: [] },
+  { id: 't3', title: 'Describe the architecture diagram',       model: 'llava:7b',   time: '09:15',     group: 'Today',     messages: [] },
+  { id: 't4', title: 'Summarize plan.md deployment phases',     model: 'llama3:8b', time: 'Yesterday', group: 'Yesterday', messages: [] },
   { id: 't5', title: 'Generate k3s manifest, 3 replicas',       model: 'mistral:7b',  time: 'Yesterday', group: 'Yesterday', messages: [] },
-  { id: 't6', title: 'Nginx port-3000 reverse proxy config',    model: 'llama3.1:8b', time: 'Mon',       group: 'This week', messages: [] },
-  { id: 't7', title: 'Why does multer reject the PDF over 5MB', model: 'llama3.1:8b', time: 'Mon',       group: 'This week', messages: [] },
-  { id: 't8', title: 'Compare phi3:mini vs mistral:7b latency', model: 'llama3.1:8b', time: 'Sun',       group: 'This week', messages: [] },
+  { id: 't6', title: 'Nginx port-3000 reverse proxy config',    model: 'llama3:8b', time: 'Mon',       group: 'This week', messages: [] },
+  { id: 't7', title: 'Why does multer reject the PDF over 5MB', model: 'llama3:8b', time: 'Mon',       group: 'This week', messages: [] },
+  { id: 't8', title: 'Compare phi3:mini vs mistral:7b latency', model: 'llama3:8b', time: 'Sun',       group: 'This week', messages: [] },
 ];
 
 const SEED_MESSAGES: Record<string, ChatMessage[]> = {
@@ -92,7 +92,7 @@ const SEED_MESSAGES: Record<string, ChatMessage[]> = {
     {
       id: 'm2',
       role: 'assistant',
-      model: 'llama3.1:8b',
+      model: 'llama3:8b',
       latency: 'first token in 184ms',
       pod: 'pod/x2p7q',
       content: "Here's the rewrite. The key change is opening an `EventSource`-compatible stream by writing `text/event-stream` headers and forwarding each chunk from the Ollama upstream as it arrives:\n\n```js\napp.post('/api/chat', async (req, res) => {\n  res.setHeader('Content-Type', 'text/event-stream');\n  res.setHeader('Cache-Control', 'no-cache');\n  res.flushHeaders();\n\n  const upstream = await axios.post(\n    `${OLLAMA_HOST}/api/chat`,\n    { ...req.body, stream: true },\n    { responseType: 'stream' }\n  );\n\n  upstream.data.on('data', (chunk) => {\n    res.write(`data: ${chunk}\\n\\n`);\n  });\n  upstream.data.on('end', () => res.end());\n});\n```\n\nA few notes specific to your setup:\n\n• The `pdf-parse` and `multer` paths can stay unchanged — they only fire on the upload route, not on chat.\n• On the React side, swap your `axios.post` for `new EventSource('/api/chat')` and accumulate `event.data` into state. The `App.tsx` cursor animation will then feel near-instant.\n• Because you're exposing this through NodePort `31434`, set `X-Accel-Buffering: no` upstream so Nginx (port 3000) doesn't buffer the stream.",
@@ -102,24 +102,24 @@ const SEED_MESSAGES: Record<string, ChatMessage[]> = {
     {
       id: 'm1',
       role: 'user',
-      content: 'the mt4lz pod restarted 3 times in the last hour. logs say `OOMKilled`. it\'s the one running llava:13b on vm2.',
+      content: 'the mt4lz pod restarted 3 times in the last hour. logs say `OOMKilled`. it\'s the one running llava:7b on vm2.',
     },
     {
       id: 'm2',
       role: 'assistant',
-      model: 'llama3.1:8b',
+      model: 'llama3:8b',
       latency: '242ms',
       pod: 'pod/x2p7q',
-      content: '`llava:13b` needs ~12 GiB resident at full context — your `resources.limits.memory: 12Gi` is right at the ceiling. Two fixes:\n\n1. **Raise the limit to 14Gi** in `ollama.yaml`. vm2-worker has 16 GiB and currently sits at 13.0 GiB used, so there\'s headroom.\n2. **Or split llava off** onto a dedicated pod with a `nodeAffinity` rule. That keeps text-only requests responsive when vision traffic spikes.\n\nI\'d go with (1) first — it\'s a one-line patch and no rescheduling needed.',
+      content: '`llava:7b` needs ~12 GiB resident at full context — your `resources.limits.memory: 12Gi` is right at the ceiling. Two fixes:\n\n1. **Raise the limit to 14Gi** in `ollama.yaml`. vm2-worker has 16 GiB and currently sits at 13.0 GiB used, so there\'s headroom.\n2. **Or split llava off** onto a dedicated pod with a `nodeAffinity` rule. That keeps text-only requests responsive when vision traffic spikes.\n\nI\'d go with (1) first — it\'s a one-line patch and no rescheduling needed.',
     },
   ],
 };
 
 const CANNED_RESPONSES: Record<string, string> = {
-  'plan.md':  'Looking at `plan.md`, the deployment is split into four phases:\n\n1. **Infrastructure** — k3s on two VMs (master 172.16.9.203, worker 172.16.9.253), `virsh` revert scripts for clean state.\n2. **Model pull** — `deploy_ai_cluster.sh` is idempotent and pulls `llama3.1:8b`, `llava:13b`, `mistral:7b` into the shared volume.\n3. **API layer** — Express proxy at `:5000` handles PDF parsing, multer uploads, and auto-routes image inputs to `llava:13b`.\n4. **Frontend** — React production build served by Nginx on `:3000` with dynamic host detection.',
-  image:      'I can see what looks like your cluster dashboard. The grid shows two nodes — a master and a worker — both reporting healthy. CPU utilization on the worker is noticeably higher than the master, which is consistent with `llava:13b` being scheduled there.',
+  'plan.md':  'Looking at `plan.md`, the deployment is split into four phases:\n\n1. **Infrastructure** — k3s on two VMs (master 172.16.9.203, worker 172.16.9.253), `virsh` revert scripts for clean state.\n2. **Model pull** — `deploy_ai_cluster.sh` is idempotent and pulls `llama3:8b`, `llava:7b`, `mistral:7b` into the shared volume.\n3. **API layer** — Express proxy at `:5000` handles PDF parsing, multer uploads, and auto-routes image inputs to `llava:7b`.\n4. **Frontend** — React production build served by Nginx on `:3000` with dynamic host detection.',
+  image:      'I can see what looks like your cluster dashboard. The grid shows two nodes — a master and a worker — both reporting healthy. CPU utilization on the worker is noticeably higher than the master, which is consistent with `llava:7b` being scheduled there.',
   manifest:   'Here\'s a Deployment manifest with 3 replicas:\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ollama\nspec:\n  replicas: 3\n  selector: { matchLabels: { app: ollama } }\n  template:\n    metadata: { labels: { app: ollama } }\n    spec:\n      containers:\n      - name: ollama\n        image: ollama/ollama:latest\n        ports: [{ containerPort: 11434 }]\n        resources:\n          limits: { cpu: "4", memory: "14Gi" }\n```',
-  default:    'Connected to the cluster. The request hit `pod/x2p7q` on vm1-master, served by `llama3.1:8b`. First token landed in **184ms** — that\'s the SSE stream you set up.\n\nAsk me about the cluster state, the deployment manifests, or hand me a file and I\'ll work through it.',
+  default:    'Connected to the cluster. The request hit `pod/x2p7q` on vm1-master, served by `llama3:8b`. First token landed in **184ms** — that\'s the SSE stream you set up.\n\nAsk me about the cluster state, the deployment manifests, or hand me a file and I\'ll work through it.',
 };
 
 const NODES: NodeInfo[] = [
@@ -128,8 +128,8 @@ const NODES: NodeInfo[] = [
 ];
 
 const POD_ROWS: PodRow[] = [
-  { name: 'ollama-text-7f9c4',   namespace: 'ai',           model: 'llama3.1:8b', status: 'Running', ready: '1/1', restarts: 0, age: '3d' },
-  { name: 'ollama-vision-a3b2',  namespace: 'ai',           model: 'llava:13b',   status: 'Running', ready: '1/1', restarts: 1, age: '3d' },
+  { name: 'ollama-text-7f9c4',   namespace: 'ai',           model: 'llama3:8b', status: 'Running', ready: '1/1', restarts: 0, age: '3d' },
+  { name: 'ollama-vision-a3b2',  namespace: 'ai',           model: 'llava:7b',   status: 'Running', ready: '1/1', restarts: 1, age: '3d' },
   { name: 'chat-backend-x2p7q',  namespace: 'ai',           model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '2d' },
   { name: 'chat-frontend-n8k1q', namespace: 'ai',           model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '2d' },
   { name: 'nginx-ingress-6b7d',  namespace: 'ingress-nginx',model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '7d' },
@@ -138,15 +138,12 @@ const POD_ROWS: PodRow[] = [
 ];
 
 const MODELS_LIST = [
-  { name: 'llama3.1:8b',  size: '4.7 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
-  { name: 'llava:13b',    size: '8.0 GB', type: 'vision', quant: 'Q4_K_M', ctx: '4k',   pulled: true  },
-  { name: 'mistral:7b',   size: '4.1 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: true  },
-  { name: 'phi3:mini',    size: '2.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: false },
-  { name: 'gemma:7b',     size: '5.0 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: false },
-  { name: 'gemma4:2b',    size: '1.8 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: false },
-  { name: 'gemma4:4b',    size: '3.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: false },
-  { name: 'qwen3.5:2b',   size: '1.7 GB', type: 'text',   quant: 'Q4_K_M', ctx: '32k',  pulled: false },
-  { name: 'qwen3.5:4b',   size: '2.6 GB', type: 'text',   quant: 'Q4_K_M', ctx: '32k',  pulled: false },
+  { name: 'llama3:8b',  size: '4.7 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
+  { name: 'llava:7b',    size: '8.0 GB', type: 'vision', quant: 'Q4_K_M', ctx: '4k',   pulled: true  },
+  { name: 'gemma:7b',     size: '5.0 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: true  },
+  { name: 'gemma2:2b',    size: '1.6 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: true  },
+  { name: 'gemma3:4b',    size: '3.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
+  { name: 'qwen2.5:3b',   size: '2.0 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -547,7 +544,7 @@ function Message({ msg, onCopy, onSpeak, streaming, hasImageAttach }: MsgProps) 
               ? <img src={a.dataUrl} alt="upload" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
               : <div className="placeholder">IMAGE</div>
             }
-            <span className="multi-modal-tag">llava:13b routed</span>
+            <span className="multi-modal-tag">llava:7b routed</span>
           </div>
         ))}
 
@@ -556,7 +553,7 @@ function Message({ msg, onCopy, onSpeak, streaming, hasImageAttach }: MsgProps) 
           <div className="modal-route-banner">
             <span>routed</span>
             <span className="arrow">→</span>
-            <span className="tag">llava:13b</span>
+            <span className="tag">llava:7b</span>
             <span style={{ color: 'var(--ink-4)' }}>·</span>
             <span style={{ color: 'var(--ink-3)' }}>vision model</span>
           </div>
@@ -653,7 +650,7 @@ function Composer({
         <div className="modal-route-banner" style={{ marginBottom: 8 }}>
           <span>will route to</span>
           <span className="arrow">→</span>
-          <span className="tag">llava:13b</span>
+          <span className="tag">llava:7b</span>
           <span style={{ color: 'var(--ink-4)' }}>·</span>
           <span style={{ color: 'var(--ink-3)' }}>vision model</span>
         </div>
@@ -963,24 +960,22 @@ function SettingsDrawer({
             onChange={e => onChange({ ...settings, model: e.target.value })}
           >
             <optgroup label="Llama">
-              <option value="llama3.1:8b">llama3.1:8b</option>
-              <option value="llama3.1:70b">llama3.1:70b</option>
+              <option value="llama3:8b">llama3:8b</option>
+              <option value="llama3:70b">llama3:70b</option>
             </optgroup>
             <optgroup label="Gemma">
               <option value="gemma:7b">gemma:7b</option>
-              <option value="gemma4:2b">gemma4:2b</option>
-              <option value="gemma4:4b">gemma4:4b</option>
+              <option value="gemma2:2b">gemma2:2b</option>
+              <option value="gemma3:4b">gemma3:4b</option>
             </optgroup>
             <optgroup label="Qwen">
-              <option value="qwen3.5:2b">qwen3.5:2b</option>
-              <option value="qwen3.5:4b">qwen3.5:4b</option>
+              <option value="qwen2.5:3b">qwen2.5:3b</option>
             </optgroup>
             <optgroup label="Other">
               <option value="mistral:7b">mistral:7b</option>
               <option value="phi3:mini">phi3:mini</option>
             </optgroup>
             <optgroup label="Vision">
-              <option value="llava:13b">llava:13b</option>
               <option value="llava:7b">llava:7b</option>
             </optgroup>
           </select>
@@ -1170,7 +1165,7 @@ export default function App() {
 
   // Settings
   const [settings, setSettings] = useState<Settings>({
-    model: 'llama3.1:8b',
+    model: 'llama3:8b',
     temp: 0.7,
     topP: 0.9,
     maxTokens: 2048,
@@ -1303,7 +1298,7 @@ export default function App() {
     setLoading(true);
 
     const hasImage = attachments.some(a => a.kind === 'image');
-    const routedModel = hasImage ? 'llava:13b' : settings.model;
+    const routedModel = hasImage ? 'llava:7b' : settings.model;
 
     // Try real backend, fall back to canned response
     let replyText = '';
@@ -1329,15 +1324,21 @@ export default function App() {
         body: formData,
       });
 
-      if (!res.ok) throw new Error('non-200');
+      if (!res.ok) {
+        let errMsg = `Backend error (HTTP ${res.status})`;
+        try {
+          const errData = await res.json();
+          if (errData.error) errMsg = errData.error;
+        } catch {}
+        throw new Error(errMsg);
+      }
       const data = await res.json();
       replyText = data.reply || data.message || data.content || 'No response.';
       latency = `${Date.now() - t0}ms`;
-    } catch {
-      // Fall back to canned response
-      await new Promise(r => setTimeout(r, 300 + Math.random() * 400));
-      replyText = pickResponse(text, attachments);
-      latency = `${Math.round(180 + Math.random() * 120)}ms`;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      replyText = `**Error:** Could not get a response from \`${routedModel}\`.\n\n\`${msg}\`\n\nCheck that the model is pulled on the cluster (see **Models** view), or select a different model in Settings.`;
+      latency = `${Date.now() - t0}ms`;
     }
 
     await simulateStream(replyText);
@@ -1505,7 +1506,7 @@ export default function App() {
                     <div className="msg-avatar">Λ</div>
                     <div className="msg-body">
                       <div className="msg-head">
-                        <span className="model">{hasImages ? 'llava:13b' : settings.model}</span>
+                        <span className="model">{hasImages ? 'llava:7b' : settings.model}</span>
                         <span className="latency">generating…</span>
                       </div>
                       {streamText

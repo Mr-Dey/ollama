@@ -52,10 +52,11 @@ app.post('/api/chat', upload.array('files'), async (req, res) => {
             stream: false
         };
 
-        // If there are images (base64 strings)
-        if (images && images.length > 0) {
-            payload.messages[0].images = images.map(img => img.split(',')[1] || img);
-            payload.model = 'llava:7b'; // Auto-switch to llava for images
+        // If there are images (base64 strings) — normalise to array
+        const imagesArr = Array.isArray(images) ? images : (images ? [images] : []);
+        if (imagesArr.length > 0) {
+            payload.messages[0].images = imagesArr.map(img => img.split(',')[1] || img);
+            payload.model = 'llava:7b';
         }
 
         const response = await axios.post(OLLAMA_URL, payload);
