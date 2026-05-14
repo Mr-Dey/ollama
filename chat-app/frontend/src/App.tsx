@@ -143,6 +143,10 @@ const MODELS_LIST = [
   { name: 'mistral:7b',   size: '4.1 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: true  },
   { name: 'phi3:mini',    size: '2.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: false },
   { name: 'gemma:7b',     size: '5.0 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: false },
+  { name: 'gemma4:2b',    size: '1.8 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: false },
+  { name: 'gemma4:4b',    size: '3.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: false },
+  { name: 'qwen3.5:2b',   size: '1.7 GB', type: 'text',   quant: 'Q4_K_M', ctx: '32k',  pulled: false },
+  { name: 'qwen3.5:4b',   size: '2.6 GB', type: 'text',   quant: 'Q4_K_M', ctx: '32k',  pulled: false },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -958,9 +962,20 @@ function SettingsDrawer({
             value={settings.model}
             onChange={e => onChange({ ...settings, model: e.target.value })}
           >
-            <optgroup label="Text">
+            <optgroup label="Llama">
               <option value="llama3.1:8b">llama3.1:8b</option>
               <option value="llama3.1:70b">llama3.1:70b</option>
+            </optgroup>
+            <optgroup label="Gemma">
+              <option value="gemma:7b">gemma:7b</option>
+              <option value="gemma4:2b">gemma4:2b</option>
+              <option value="gemma4:4b">gemma4:4b</option>
+            </optgroup>
+            <optgroup label="Qwen">
+              <option value="qwen3.5:2b">qwen3.5:2b</option>
+              <option value="qwen3.5:4b">qwen3.5:4b</option>
+            </optgroup>
+            <optgroup label="Other">
               <option value="mistral:7b">mistral:7b</option>
               <option value="phi3:mini">phi3:mini</option>
             </optgroup>
