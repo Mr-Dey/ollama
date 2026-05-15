@@ -5,10 +5,10 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const pdf = require('pdf-parse');
 const fs = require('fs');
+const https = require('https');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { exec } = require('child_process');
 
 const app = express();
 const PORT        = process.env.PORT       || 5000;
@@ -94,12 +94,40 @@ async function extractText(filePath, mimeType) {
   return '';
 }
 
-function runCmd(cmd) {
-  return new Promise(resolve => {
-    exec(cmd, { timeout: 10000 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, out: stdout.trim(), err: stderr.trim() });
+// ─── Kubernetes In-Cluster API ────────────────────────────────────────────────
+
+const K8S_API    = 'https://kubernetes.default.svc.cluster.local';
+const SA_TOKEN   = '/var/run/secrets/kubernetes.io/serviceaccount/token';
+const SA_CA      = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
+
+function k8sClient() {
+  try {
+    const token = fs.readFileSync(SA_TOKEN, 'utf8').trim();
+    const ca    = fs.readFileSync(SA_CA);
+    return axios.create({
+      baseURL: K8S_API,
+      headers: { Authorization: `Bearer ${token}` },
+      httpsAgent: new https.Agent({ ca }),
+      timeout: 8000,
     });
-  });
+  } catch {
+    return null; // running outside cluster (dev mode)
+  }
+}
+
+function parseCpu(str) {
+  if (!str) return 0;
+  if (str.endsWith('n'))  return parseInt(str);                    // nanocores
+  if (str.endsWith('m'))  return parseInt(str) * 1_000_000;        // millicores → nano
+  return parseInt(str) * 1_000_000_000;                            // cores → nano
+}
+
+function parseMem(str) {
+  if (!str) return 0;
+  if (str.endsWith('Ki')) return parseInt(str) * 1024;
+  if (str.endsWith('Mi')) return parseInt(str) * 1024 ** 2;
+  if (str.endsWith('Gi')) return parseInt(str) * 1024 ** 3;
+  return parseInt(str);
 }
 
 // ─── Auth Routes ──────────────────────────────────────────────────────────────
@@ -298,34 +326,73 @@ app.patch('/api/admin/users/:id/password', requireAuth, requireAdmin, async (req
 
 app.get('/api/cluster/status', requireAuth, async (req, res) => {
   try {
-    const [nodes, pods, modelsRes] = await Promise.all([
-      runCmd('k3s kubectl get nodes -o json 2>/dev/null'),
-      runCmd('k3s kubectl get pods -A -o json 2>/dev/null'),
-      axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 }).then(r => r.data.models || []).catch(() => []),
+    const k8s = k8sClient();
+    const modelsRes = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 })
+      .then(r => r.data.models || []).catch(() => []);
+
+    if (!k8s) {
+      return res.json({ nodes: [], pods: [], models: modelsRes.map(m => ({ name: m.name, size: m.size })) });
+    }
+
+    const [nodesRes, podsRes, metricsRes] = await Promise.allSettled([
+      k8s.get('/api/v1/nodes'),
+      k8s.get('/api/v1/pods?limit=500'),
+      k8s.get('/apis/metrics.k8s.io/v1beta1/nodes'),
     ]);
 
-    const nodeList = nodes.ok ? JSON.parse(nodes.out).items : [];
-    const podList  = pods.ok  ? JSON.parse(pods.out).items  : [];
+    const nodeList    = nodesRes.status    === 'fulfilled' ? nodesRes.value.data.items    : [];
+    const podList     = podsRes.status     === 'fulfilled' ? podsRes.value.data.items     : [];
+    const metricsList = metricsRes.status  === 'fulfilled' ? metricsRes.value.data.items  : [];
 
-    res.json({
-      nodes: nodeList.map(n => ({
-        name:   n.metadata.name,
-        role:   n.labels?.['node-role.kubernetes.io/master'] !== undefined ? 'master' : 'worker',
-        status: n.status?.conditions?.find(c => c.type === 'Ready')?.status === 'True' ? 'Ready' : 'NotReady',
-        cpu:    n.status?.capacity?.cpu,
-        memory: n.status?.capacity?.memory,
-      })),
-      pods: podList.map(p => ({
-        name:      p.metadata.name,
-        namespace: p.metadata.namespace,
-        status:    p.status?.phase,
-        ready:     `${p.status?.containerStatuses?.filter(c => c.ready).length || 0}/${p.spec?.containers?.length || 0}`,
-        restarts:  p.status?.containerStatuses?.[0]?.restartCount || 0,
-        age:       p.metadata.creationTimestamp,
-      })),
-      models: modelsRes.map(m => ({ name: m.name, size: m.size })),
+    const metricsByNode = {};
+    for (const m of metricsList) {
+      metricsByNode[m.metadata.name] = m.usage;
+    }
+
+    const podsByNode = {};
+    for (const p of podList) {
+      const node = p.spec?.nodeName;
+      if (node) podsByNode[node] = (podsByNode[node] || 0) + 1;
+    }
+
+    const nodes = nodeList.map(n => {
+      const nodeName = n.metadata.name;
+      const capacity = n.status?.capacity || {};
+      const labels   = n.metadata?.labels || {};
+      const usage    = metricsByNode[nodeName] || {};
+
+      const cpuCap  = parseCpu(capacity.cpu);
+      const memCap  = parseMem(capacity.memory);
+      const cpuUse  = parseCpu(usage.cpu);
+      const memUse  = parseMem(usage.memory);
+
+      const ip = n.status?.addresses?.find(a => a.type === 'InternalIP')?.address || '';
+      const role = labels['node-role.kubernetes.io/master'] !== undefined ||
+                   labels['node-role.kubernetes.io/control-plane'] !== undefined
+        ? 'master' : 'worker';
+
+      return {
+        name: nodeName,
+        role,
+        ip,
+        cpu:  cpuCap  > 0 ? Math.round((cpuUse  / cpuCap)  * 100) : 0,
+        mem:  memCap  > 0 ? Math.round((memUse  / memCap)  * 100) : 0,
+        pods: podsByNode[nodeName] || 0,
+      };
     });
+
+    const pods = podList.map(p => ({
+      name:      p.metadata.name,
+      namespace: p.metadata.namespace,
+      status:    p.status?.phase,
+      ready:     `${p.status?.containerStatuses?.filter(c => c.ready).length || 0}/${p.spec?.containers?.length || 0}`,
+      restarts:  p.status?.containerStatuses?.[0]?.restartCount || 0,
+      age:       p.metadata.creationTimestamp,
+    }));
+
+    res.json({ nodes, pods, models: modelsRes.map(m => ({ name: m.name, size: m.size })) });
   } catch (err) {
+    console.error('Cluster status error:', err.message);
     res.status(500).json({ error: 'Failed to fetch cluster status' });
   }
 });
