@@ -1451,3 +1451,23 @@ input, textarea { font: inherit; color: inherit; }
 .serif { font-family: var(--font-serif); font-style: italic; }
 .text-ink-3 { color: var(--ink-3); }
 .text-ink-2 { color: var(--ink-2); }
+
+/* ─── Login ── */
+.login-page { display:grid; place-items:center; min-height:100vh; background:var(--bg); }
+.login-card { width:360px; border:1px solid var(--line); border-radius:12px; background:var(--bg-elev); padding:40px; }
+.login-brand { text-align:center; margin-bottom:28px; }
+.login-brand .glyph { font-family:var(--font-serif); font-size:44px; color:var(--bone); line-height:1; }
+.login-brand h2 { margin:8px 0 4px; font-size:18px; font-weight:600; }
+.login-brand p { font-size:13px; color:var(--ink-4); margin:0; }
+.login-form .field { margin-bottom:16px; }
+.login-input { width:100%; box-sizing:border-box; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:9px 12px; color:var(--ink); font-size:14px; font-family:var(--font-sans); outline:none; }
+.login-input:focus { border-color:var(--bone); }
+.login-error { color:#f87171; font-size:13px; margin-bottom:12px; }
+.login-btn { width:100%; padding:10px; background:var(--bone); color:var(--bone-ink); border:none; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; font-family:var(--font-sans); }
+.login-btn:disabled { opacity:0.6; cursor:not-allowed; }
+.logout-btn { background:none; border:none; cursor:pointer; color:var(--ink-4); padding:4px; border-radius:4px; display:flex; align-items:center; }
+.logout-btn:hover { color:var(--ink); background:var(--bg-elev); }
+.history-item { position:relative; }
+.history-item .del-btn { position:absolute; right:8px; top:50%; transform:translateY(-50%); display:none; background:none; border:none; cursor:pointer; color:var(--ink-4); padding:2px 4px; border-radius:3px; }
+.history-item:hover .del-btn { display:flex; }
+.history-item .del-btn:hover { color:#f87171; }

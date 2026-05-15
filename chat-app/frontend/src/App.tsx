@@ -66,98 +66,63 @@ interface PodRow {
   age: string;
 }
 
-type View = 'chat' | 'cluster' | 'models';
+type View = 'chat' | 'cluster' | 'models' | 'admin';
 
-// ─── Seed Data ────────────────────────────────────────────────────────────────
+// ─── API Helpers ──────────────────────────────────────────────────────────────
 
-const SEED_THREADS: Thread[] = [
-  { id: 't1', title: 'Refactor server.js to stream SSE',        model: 'llama3:8b', time: '14:02',     group: 'Today',     messages: [] },
-  { id: 't2', title: 'Diagnose mt4lz pod CrashLoopBackoff',     model: 'llama3:8b', time: '11:48',     group: 'Today',     messages: [] },
-  { id: 't3', title: 'Describe the architecture diagram',       model: 'llava:7b',   time: '09:15',     group: 'Today',     messages: [] },
-  { id: 't4', title: 'Summarize plan.md deployment phases',     model: 'llama3:8b', time: 'Yesterday', group: 'Yesterday', messages: [] },
-  { id: 't5', title: 'Generate k3s manifest, 3 replicas',       model: 'mistral:7b',  time: 'Yesterday', group: 'Yesterday', messages: [] },
-  { id: 't6', title: 'Nginx port-3000 reverse proxy config',    model: 'llama3:8b', time: 'Mon',       group: 'This week', messages: [] },
-  { id: 't7', title: 'Why does multer reject the PDF over 5MB', model: 'llama3:8b', time: 'Mon',       group: 'This week', messages: [] },
-  { id: 't8', title: 'Compare phi3:mini vs mistral:7b latency', model: 'llama3:8b', time: 'Sun',       group: 'This week', messages: [] },
-];
+function computeGroup(dateStr: string): string {
+  const now = new Date();
+  const d = new Date(dateStr);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today.getTime() - 86400000);
+  const weekAgo = new Date(today.getTime() - 7 * 86400000);
+  const target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
-const SEED_MESSAGES: Record<string, ChatMessage[]> = {
-  t1: [
-    {
-      id: 'm1',
-      role: 'user',
-      content: 'Refactor server.js to stream tokens over SSE. The current implementation buffers the whole response from the ollama-service endpoint — clients are waiting 4-6s for the first token. Use the streaming flag in the Ollama API.',
-      attachments: [{ kind: 'file', name: 'server.js', ext: 'JS', size: '8.2 KB' }],
-    },
-    {
-      id: 'm2',
-      role: 'assistant',
-      model: 'llama3:8b',
-      latency: 'first token in 184ms',
-      pod: 'pod/x2p7q',
-      content: "Here's the rewrite. The key change is opening an `EventSource`-compatible stream by writing `text/event-stream` headers and forwarding each chunk from the Ollama upstream as it arrives:\n\n```js\napp.post('/api/chat', async (req, res) => {\n  res.setHeader('Content-Type', 'text/event-stream');\n  res.setHeader('Cache-Control', 'no-cache');\n  res.flushHeaders();\n\n  const upstream = await axios.post(\n    `${OLLAMA_HOST}/api/chat`,\n    { ...req.body, stream: true },\n    { responseType: 'stream' }\n  );\n\n  upstream.data.on('data', (chunk) => {\n    res.write(`data: ${chunk}\\n\\n`);\n  });\n  upstream.data.on('end', () => res.end());\n});\n```\n\nA few notes specific to your setup:\n\n• The `pdf-parse` and `multer` paths can stay unchanged — they only fire on the upload route, not on chat.\n• On the React side, swap your `axios.post` for `new EventSource('/api/chat')` and accumulate `event.data` into state. The `App.tsx` cursor animation will then feel near-instant.\n• Because you're exposing this through NodePort `31434`, set `X-Accel-Buffering: no` upstream so Nginx (port 3000) doesn't buffer the stream.",
-    },
-  ],
-  t2: [
-    {
-      id: 'm1',
-      role: 'user',
-      content: 'the mt4lz pod restarted 3 times in the last hour. logs say `OOMKilled`. it\'s the one running llava:7b on vm2.',
-    },
-    {
-      id: 'm2',
-      role: 'assistant',
-      model: 'llama3:8b',
-      latency: '242ms',
-      pod: 'pod/x2p7q',
-      content: '`llava:7b` needs ~12 GiB resident at full context — your `resources.limits.memory: 12Gi` is right at the ceiling. Two fixes:\n\n1. **Raise the limit to 14Gi** in `ollama.yaml`. vm2-worker has 16 GiB and currently sits at 13.0 GiB used, so there\'s headroom.\n2. **Or split llava off** onto a dedicated pod with a `nodeAffinity` rule. That keeps text-only requests responsive when vision traffic spikes.\n\nI\'d go with (1) first — it\'s a one-line patch and no rescheduling needed.',
-    },
-  ],
-};
+  if (target.getTime() === today.getTime()) return 'Today';
+  if (target.getTime() === yesterday.getTime()) return 'Yesterday';
+  if (target >= weekAgo) return 'This week';
+  return 'Older';
+}
 
-const CANNED_RESPONSES: Record<string, string> = {
-  'plan.md':  'Looking at `plan.md`, the deployment is split into four phases:\n\n1. **Infrastructure** — k3s on two VMs (master 172.16.9.203, worker 172.16.9.253), `virsh` revert scripts for clean state.\n2. **Model pull** — `deploy_ai_cluster.sh` is idempotent and pulls `llama3:8b`, `llava:7b`, `mistral:7b` into the shared volume.\n3. **API layer** — Express proxy at `:5000` handles PDF parsing, multer uploads, and auto-routes image inputs to `llava:7b`.\n4. **Frontend** — React production build served by Nginx on `:3000` with dynamic host detection.',
-  image:      'I can see what looks like your cluster dashboard. The grid shows two nodes — a master and a worker — both reporting healthy. CPU utilization on the worker is noticeably higher than the master, which is consistent with `llava:7b` being scheduled there.',
-  manifest:   'Here\'s a Deployment manifest with 3 replicas:\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ollama\nspec:\n  replicas: 3\n  selector: { matchLabels: { app: ollama } }\n  template:\n    metadata: { labels: { app: ollama } }\n    spec:\n      containers:\n      - name: ollama\n        image: ollama/ollama:latest\n        ports: [{ containerPort: 11434 }]\n        resources:\n          limits: { cpu: "4", memory: "14Gi" }\n```',
-  default:    'Connected to the cluster. The request hit `pod/x2p7q` on vm1-master, served by `llama3:8b`. First token landed in **184ms** — that\'s the SSE stream you set up.\n\nAsk me about the cluster state, the deployment manifests, or hand me a file and I\'ll work through it.',
-};
+function computeTime(dateStr: string): string {
+  const now = new Date();
+  const d = new Date(dateStr);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
-const NODES: NodeInfo[] = [
-  { role: 'master', name: 'vm1-master', ip: '172.16.9.203', cpu: 38, mem: 52, pods: 9  },
-  { role: 'worker', name: 'vm2-worker', ip: '172.16.9.253', cpu: 74, mem: 81, pods: 14 },
-];
+  if (target.getTime() === today.getTime()) {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
 
-const POD_ROWS: PodRow[] = [
-  { name: 'ollama-text-7f9c4',   namespace: 'ai',           model: 'llama3:8b', status: 'Running', ready: '1/1', restarts: 0, age: '3d' },
-  { name: 'ollama-vision-a3b2',  namespace: 'ai',           model: 'llava:7b',   status: 'Running', ready: '1/1', restarts: 1, age: '3d' },
-  { name: 'chat-backend-x2p7q',  namespace: 'ai',           model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '2d' },
-  { name: 'chat-frontend-n8k1q', namespace: 'ai',           model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '2d' },
-  { name: 'nginx-ingress-6b7d',  namespace: 'ingress-nginx',model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '7d' },
-  { name: 'coredns-787d4945fb',  namespace: 'kube-system',  model: undefined,     status: 'Running', ready: '1/1', restarts: 0, age: '7d' },
-  { name: 'metrics-server-648b', namespace: 'kube-system',  model: undefined,     status: 'Pending', ready: '0/1', restarts: 3, age: '1d' },
-];
+function apiToThread(conv: any): Thread {
+  return {
+    id: conv._id,
+    title: conv.title || 'New conversation',
+    model: conv.model || 'llama3:8b',
+    time: computeTime(conv.updatedAt || conv.createdAt || new Date().toISOString()),
+    group: computeGroup(conv.updatedAt || conv.createdAt || new Date().toISOString()),
+    messages: (conv.messages || []).map(apiMsgToLocal),
+  };
+}
 
-const MODELS_LIST = [
-  { name: 'llama3:8b',  size: '4.7 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
-  { name: 'llava:7b',    size: '8.0 GB', type: 'vision', quant: 'Q4_K_M', ctx: '4k',   pulled: true  },
-  { name: 'gemma:7b',     size: '5.0 GB', type: 'text',   quant: 'Q4_0',   ctx: '8k',   pulled: true  },
-  { name: 'gemma2:2b',    size: '1.6 GB', type: 'text',   quant: 'Q4_K_M', ctx: '8k',   pulled: true  },
-  { name: 'gemma3:4b',    size: '3.3 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
-  { name: 'qwen2.5:3b',   size: '2.0 GB', type: 'text',   quant: 'Q4_K_M', ctx: '128k', pulled: true  },
-];
+function apiMsgToLocal(m: any): ChatMessage {
+  return {
+    id: m._id || m.id || genId(),
+    role: m.role,
+    content: m.content,
+    model: m.model,
+    latency: m.latency,
+    pod: m.pod,
+    attachments: m.attachments,
+  };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function genId(): string {
   return Math.random().toString(36).slice(2, 10);
-}
-
-function pickResponse(content: string, attachments?: Attachment[]): string {
-  if (attachments?.some(a => a.kind === 'image')) return CANNED_RESPONSES.image;
-  const lower = content.toLowerCase();
-  if (lower.includes('plan.md'))                                    return CANNED_RESPONSES['plan.md'];
-  if (lower.includes('manifest') || lower.includes('replica'))     return CANNED_RESPONSES.manifest;
-  return CANNED_RESPONSES.default;
 }
 
 // Render message content: handle code fences and bold
@@ -282,6 +247,87 @@ const IcoPhone = () => (
     <line x1="12" y1="18" x2="12.01" y2="18"/>
   </svg>
 );
+const IcoLogOut = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+    <polyline points="16 17 21 12 16 7"/>
+    <line x1="21" y1="12" x2="9" y2="12"/>
+  </svg>
+);
+const IcoTrash = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <polyline points="3 6 5 6 21 6"/>
+    <path d="M19 6l-1 14H6L5 6"/>
+    <path d="M10 11v6"/>
+    <path d="M14 11v6"/>
+    <path d="M9 6V4h6v2"/>
+  </svg>
+);
+const IcoUsers = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+    <circle cx="9" cy="7" r="4"/>
+    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+  </svg>
+);
+
+// ─── LoginPage ────────────────────────────────────────────────────────────────
+
+function LoginPage({
+  form,
+  onChange,
+  onSubmit,
+  error,
+  loading,
+}: {
+  form: { username: string; password: string };
+  onChange: (f: { username: string; password: string }) => void;
+  onSubmit: (e: React.FormEvent) => void;
+  error: string;
+  loading: boolean;
+}) {
+  return (
+    <div className="login-page">
+      <div className="login-card">
+        <div className="login-brand">
+          <div className="glyph">Λ</div>
+          <h2>Ollama Cluster</h2>
+          <p>Sign in to your workspace</p>
+        </div>
+        <form onSubmit={onSubmit} className="login-form">
+          <div className="field">
+            <div className="label">Username</div>
+            <input
+              className="login-input"
+              type="text"
+              value={form.username}
+              onChange={e => onChange({ ...form, username: e.target.value })}
+              placeholder="username"
+              autoFocus
+              required
+            />
+          </div>
+          <div className="field">
+            <div className="label">Password</div>
+            <input
+              className="login-input"
+              type="password"
+              value={form.password}
+              onChange={e => onChange({ ...form, password: e.target.value })}
+              placeholder="••••••••"
+              required
+            />
+          </div>
+          {error && <div className="login-error">{error}</div>}
+          <button type="submit" className="login-btn" disabled={loading}>
+            {loading ? 'Signing in…' : 'Sign in →'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
 
 // ─── TopBar ───────────────────────────────────────────────────────────────────
 
@@ -299,6 +345,7 @@ interface TopBarProps {
   onToggleTheme: () => void;
   onMobileOverlay: () => void;
   activeThread: Thread | undefined;
+  currentUser: { username: string; role: string; email?: string } | null;
 }
 
 function TopBar({
@@ -315,6 +362,7 @@ function TopBar({
   onToggleTheme,
   onMobileOverlay,
   activeThread,
+  currentUser,
 }: TopBarProps) {
   return (
     <header className="topbar">
@@ -329,7 +377,6 @@ function TopBar({
       </div>
 
       <div className="topbar-mid">
-        {/* View tabs */}
         <button
           className={`nav-item${view === 'chat' ? ' active' : ''}`}
           onClick={() => onViewChange('chat')}
@@ -359,6 +406,12 @@ function TopBar({
               {activeThread.title}
             </span>
           </>
+        )}
+
+        {currentUser && (
+          <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-4)' }}>
+            {currentUser.username}
+          </span>
         )}
       </div>
 
@@ -410,11 +463,25 @@ interface SidebarProps {
   activeId: string;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onDeleteThread: (id: string) => void;
   view: View;
   onViewChange: (v: View) => void;
+  currentUser: { username: string; role: string; email?: string } | null;
+  onLogout: () => void;
 }
 
-function Sidebar({ collapsed, threads, activeId, onSelect, onNewChat, view, onViewChange }: SidebarProps) {
+function Sidebar({
+  collapsed,
+  threads,
+  activeId,
+  onSelect,
+  onNewChat,
+  onDeleteThread,
+  view,
+  onViewChange,
+  currentUser,
+  onLogout,
+}: SidebarProps) {
   const groups = useMemo(() => {
     const map: Record<string, Thread[]> = {};
     const order: string[] = [];
@@ -424,6 +491,32 @@ function Sidebar({ collapsed, threads, activeId, onSelect, onNewChat, view, onVi
     }
     return order.map(g => ({ label: g, items: map[g] }));
   }, [threads]);
+
+  const navViews: { v: View; label: string; icon: React.ReactNode }[] = [
+    {
+      v: 'chat',
+      label: 'Chat',
+      icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>,
+    },
+    {
+      v: 'models',
+      label: 'Models',
+      icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>,
+    },
+    {
+      v: 'cluster',
+      label: 'Cluster',
+      icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>,
+    },
+  ];
+
+  if (currentUser?.role === 'admin') {
+    navViews.push({
+      v: 'admin',
+      label: 'Admin',
+      icon: <IcoUsers />,
+    });
+  }
 
   return (
     <aside className="sidebar">
@@ -437,16 +530,14 @@ function Sidebar({ collapsed, threads, activeId, onSelect, onNewChat, view, onVi
 
       <div className="side-section">
         <div className="nav-list">
-          {(['chat', 'cluster', 'models'] as View[]).map(v => (
+          {navViews.map(({ v, label, icon }) => (
             <button
               key={v}
               className={`nav-item${view === v ? ' active' : ''}`}
               onClick={() => onViewChange(v)}
             >
-              {v === 'chat'    && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>}
-              {v === 'cluster' && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>}
-              {v === 'models'  && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>}
-              <span style={{ textTransform: 'capitalize' }}>{v}</span>
+              {icon}
+              <span>{label}</span>
               <span className="nav-tag">{v === 'chat' ? `${threads.length}` : ''}</span>
             </button>
           ))}
@@ -472,6 +563,13 @@ function Sidebar({ collapsed, threads, activeId, onSelect, onNewChat, view, onVi
                   <span>·</span>
                   <span>{t.time}</span>
                 </div>
+                <button
+                  className="del-btn"
+                  title="Delete conversation"
+                  onClick={e => { e.stopPropagation(); onDeleteThread(t.id); }}
+                >
+                  <IcoTrash />
+                </button>
               </div>
             ))}
           </div>
@@ -479,11 +577,14 @@ function Sidebar({ collapsed, threads, activeId, onSelect, onNewChat, view, onVi
       </div>
 
       <div className="side-foot">
-        <div className="avatar">U</div>
-        <div>
-          <div className="who">k3s-admin</div>
-          <div className="role">cluster operator</div>
+        <div className="avatar">{currentUser?.username?.[0]?.toUpperCase() ?? 'U'}</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="who">{currentUser?.username ?? 'user'}</div>
+          <div className="role">{currentUser?.role ?? 'member'}</div>
         </div>
+        <button className="logout-btn" onClick={onLogout} title="Sign out">
+          <IcoLogOut />
+        </button>
       </div>
     </aside>
   );
@@ -741,8 +842,35 @@ function Composer({
 
 // ─── ClusterView ──────────────────────────────────────────────────────────────
 
-function ClusterView({ online }: { online: boolean }) {
-  const runningPods = POD_ROWS.filter(p => p.status === 'Running').length;
+function ClusterView({ online, token }: { online: boolean; token: string }) {
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+  const [pods, setPods] = useState<PodRow[]>([]);
+  const [clusterLoading, setClusterLoading] = useState(true);
+
+  useEffect(() => {
+    setClusterLoading(true);
+    fetch(`/api/cluster/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.nodes) setNodes(data.nodes);
+        if (data.pods) setPods(data.pods);
+      })
+      .catch(() => {})
+      .finally(() => setClusterLoading(false));
+  }, [token]);
+
+  const runningPods = pods.filter(p => p.status === 'Running').length;
+
+  // Compute aggregate CPU/mem from nodes if available
+  const avgCpu = nodes.length > 0
+    ? Math.round(nodes.reduce((s, n) => s + (n.cpu ?? 0), 0) / nodes.length)
+    : 0;
+  const avgMem = nodes.length > 0
+    ? Math.round(nodes.reduce((s, n) => s + (n.mem ?? 0), 0) / nodes.length)
+    : 0;
+
   return (
     <div className="cluster-view">
       <div className="cluster-head">
@@ -751,8 +879,6 @@ function ClusterView({ online }: { online: boolean }) {
           <h2>Cluster</h2>
         </div>
         <div style={{ display: 'flex', gap: 24, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-          <span><span style={{ color: 'var(--ink-3)' }}>version </span><span>v1.28.4+k3s1</span></span>
-          <span><span style={{ color: 'var(--ink-3)' }}>master </span><span>172.16.9.203</span></span>
           <span><span style={{ color: 'var(--ink-3)' }}>status </span>
             <span style={{ color: online ? 'var(--signal)' : 'var(--danger)' }}>
               {online ? 'healthy' : 'degraded'}
@@ -761,129 +887,176 @@ function ClusterView({ online }: { online: boolean }) {
         </div>
       </div>
 
-      {/* Metrics */}
-      <div className="metric-grid">
-        {[
-          { k: 'Nodes',    v: '2',                 unit: '',      trend: '↑ all healthy', tClass: '' },
-          { k: 'Pods',     v: `${runningPods}`,    unit: `/${POD_ROWS.length}`, trend: '↑ running',  tClass: '' },
-          { k: 'CPU',      v: '56',                unit: '%',     trend: '⬤ nominal',     tClass: 'flat' },
-          { k: 'Memory',   v: '67',                unit: '%',     trend: '⚠ high',        tClass: 'warn' },
-        ].map(m => (
-          <div key={m.k} className="metric">
-            <div className="k">{m.k}</div>
-            <div className="v">{m.v}<span className="unit">{m.unit}</span></div>
-            <div className={`trend ${m.tClass}`}>{m.trend}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Nodes */}
-      <div className="section-head">
-        Nodes
-        <div className="actions">
-          <button>Refresh</button>
-          <button>Describe</button>
+      {clusterLoading ? (
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 60, color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+          Loading cluster data…
         </div>
-      </div>
-      <div className="node-grid">
-        {NODES.map(n => (
-          <div key={n.name} className="node-card">
-            <div className="node-head">
-              <span className={`role${n.role === 'worker' ? ' worker' : ''}`}>{n.role}</span>
-              <span className="name">{n.name}</span>
-              <span className="dot" />
-              <span className="ip">{n.ip}</span>
-            </div>
-            <div className="node-body">
-              <div className="node-stat">
-                <div className="k">CPU</div>
-                <div className="v">{n.cpu}%</div>
-                <div className="node-bar signal"><span style={{ width: `${n.cpu}%` }} /></div>
+      ) : (
+        <>
+          {/* Metrics */}
+          <div className="metric-grid">
+            {[
+              { k: 'Nodes',  v: `${nodes.length}`,     unit: '',           trend: nodes.length > 0 ? '↑ all healthy' : '—', tClass: '' },
+              { k: 'Pods',   v: `${runningPods}`,       unit: `/${pods.length}`, trend: runningPods === pods.length ? '↑ running' : '⚠ some down', tClass: runningPods < pods.length ? 'warn' : '' },
+              { k: 'CPU',    v: `${avgCpu}`,            unit: '%',          trend: avgCpu > 80 ? '⚠ high' : '⬤ nominal', tClass: avgCpu > 80 ? 'warn' : 'flat' },
+              { k: 'Memory', v: `${avgMem}`,            unit: '%',          trend: avgMem > 80 ? '⚠ high' : '⬤ nominal', tClass: avgMem > 80 ? 'warn' : 'flat' },
+            ].map(m => (
+              <div key={m.k} className="metric">
+                <div className="k">{m.k}</div>
+                <div className="v">{m.v}<span className="unit">{m.unit}</span></div>
+                <div className={`trend ${m.tClass}`}>{m.trend}</div>
               </div>
-              <div className="node-stat">
-                <div className="k">Memory</div>
-                <div className="v">{n.mem}%</div>
-                <div className="node-bar"><span style={{ width: `${n.mem}%` }} /></div>
-              </div>
-              <div className="node-stat">
-                <div className="k">Pods</div>
-                <div className="v">{n.pods}</div>
-                <div className="node-bar"><span style={{ width: `${Math.min(100, n.pods * 5)}%` }} /></div>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Pods table */}
-      <div className="section-head">
-        Pods
-        <div className="actions">
-          <button>All namespaces</button>
-          <button>Refresh</button>
-        </div>
-      </div>
-      <div className="pod-table-wrap">
-        <table className="pod-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Namespace</th>
-              <th>Model</th>
-              <th>Status</th>
-              <th>Ready</th>
-              <th>Restarts</th>
-              <th>Age</th>
-            </tr>
-          </thead>
-          <tbody>
-            {POD_ROWS.map(p => (
-              <tr key={p.name}>
-                <td className="pod-name">{p.name}</td>
-                <td>{p.namespace}</td>
-                <td className="model">{p.model ?? '—'}</td>
-                <td>
-                  <span className={`badge${p.status !== 'Running' ? ' warn' : ''}`}>
-                    <span className="dot" />
-                    {p.status}
-                  </span>
-                </td>
-                <td>{p.ready}</td>
-                <td>{p.restarts}</td>
-                <td className="age">{p.age}</td>
-              </tr>
             ))}
-          </tbody>
-        </table>
-      </div>
+          </div>
 
-      {/* Service card */}
-      <div className="section-head">Services</div>
-      <div className="service-card">
-        <div>
-          <div className="svc-k">API</div>
-          <div className="svc-v">chat-backend <span className="endpoint">:5000</span></div>
-        </div>
-        <div>
-          <div className="svc-k">Frontend</div>
-          <div className="svc-v">chat-frontend <span className="endpoint">:3000</span></div>
-        </div>
-        <div>
-          <div className="svc-k">Ollama NodePort</div>
-          <div className="svc-v">ollama-svc <span className="endpoint">:31434</span></div>
-        </div>
-        <div>
-          <div className="svc-k">Ingress</div>
-          <div className="svc-v">nginx <span className="endpoint">:80/:443</span></div>
-        </div>
-      </div>
+          {/* Nodes */}
+          {nodes.length > 0 && (
+            <>
+              <div className="section-head">
+                Nodes
+                <div className="actions">
+                  <button onClick={() => {
+                    fetch(`/api/cluster/status`, { headers: { Authorization: `Bearer ${token}` } })
+                      .then(r => r.json()).then(data => { if (data.nodes) setNodes(data.nodes); if (data.pods) setPods(data.pods); }).catch(() => {});
+                  }}>Refresh</button>
+                </div>
+              </div>
+              <div className="node-grid">
+                {nodes.map(n => (
+                  <div key={n.name} className="node-card">
+                    <div className="node-head">
+                      <span className={`role${n.role === 'worker' ? ' worker' : ''}`}>{n.role}</span>
+                      <span className="name">{n.name}</span>
+                      <span className="dot" />
+                      <span className="ip">{n.ip}</span>
+                    </div>
+                    <div className="node-body">
+                      <div className="node-stat">
+                        <div className="k">CPU</div>
+                        <div className="v">{n.cpu}%</div>
+                        <div className="node-bar signal"><span style={{ width: `${n.cpu}%` }} /></div>
+                      </div>
+                      <div className="node-stat">
+                        <div className="k">Memory</div>
+                        <div className="v">{n.mem}%</div>
+                        <div className="node-bar"><span style={{ width: `${n.mem}%` }} /></div>
+                      </div>
+                      <div className="node-stat">
+                        <div className="k">Pods</div>
+                        <div className="v">{n.pods}</div>
+                        <div className="node-bar"><span style={{ width: `${Math.min(100, n.pods * 5)}%` }} /></div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* Pods table */}
+          {pods.length > 0 && (
+            <>
+              <div className="section-head">
+                Pods
+                <div className="actions">
+                  <button>All namespaces</button>
+                </div>
+              </div>
+              <div className="pod-table-wrap">
+                <table className="pod-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Namespace</th>
+                      <th>Model</th>
+                      <th>Status</th>
+                      <th>Ready</th>
+                      <th>Restarts</th>
+                      <th>Age</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pods.map(p => (
+                      <tr key={p.name}>
+                        <td className="pod-name">{p.name}</td>
+                        <td>{p.namespace}</td>
+                        <td className="model">{p.model ?? '—'}</td>
+                        <td>
+                          <span className={`badge${p.status !== 'Running' ? ' warn' : ''}`}>
+                            <span className="dot" />
+                            {p.status}
+                          </span>
+                        </td>
+                        <td>{p.ready}</td>
+                        <td>{p.restarts}</td>
+                        <td className="age">{p.age}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {nodes.length === 0 && pods.length === 0 && (
+            <div style={{ textAlign: 'center', padding: 60, color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+              No cluster data available. Check backend connection.
+            </div>
+          )}
+
+          {/* Service card */}
+          <div className="section-head">Services</div>
+          <div className="service-card">
+            <div>
+              <div className="svc-k">API</div>
+              <div className="svc-v">chat-backend <span className="endpoint">:5000</span></div>
+            </div>
+            <div>
+              <div className="svc-k">Frontend</div>
+              <div className="svc-v">chat-frontend <span className="endpoint">:3000</span></div>
+            </div>
+            <div>
+              <div className="svc-k">Ollama NodePort</div>
+              <div className="svc-v">ollama-svc <span className="endpoint">:31434</span></div>
+            </div>
+            <div>
+              <div className="svc-k">Ingress</div>
+              <div className="svc-v">nginx <span className="endpoint">:80/:443</span></div>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
 // ─── ModelsView ───────────────────────────────────────────────────────────────
 
-function ModelsView({ activeModel, onSelect }: { activeModel: string; onSelect: (m: string) => void }) {
+function ModelsView({
+  activeModel,
+  onSelect,
+  token,
+}: {
+  activeModel: string;
+  onSelect: (m: string) => void;
+  token: string;
+}) {
+  const [models, setModels] = useState<{ name: string; size: string }[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+
+  useEffect(() => {
+    setModelsLoading(true);
+    fetch(`/api/models`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) setModels(data);
+      })
+      .catch(() => {})
+      .finally(() => setModelsLoading(false));
+  }, [token]);
+
   return (
     <div className="cluster-view">
       <div className="cluster-head">
@@ -893,37 +1066,213 @@ function ModelsView({ activeModel, onSelect }: { activeModel: string; onSelect: 
         </div>
       </div>
       <div className="section-head">Available models</div>
-      <div className="pod-table-wrap">
-        <table className="pod-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>Quant</th>
-              <th>Context</th>
-              <th>Size</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {MODELS_LIST.map(m => (
-              <tr key={m.name} onClick={() => m.pulled && onSelect(m.name)} style={{ cursor: m.pulled ? 'pointer' : 'default' }}>
-                <td className={`pod-name${m.name === activeModel ? ' model' : ''}`}>{m.name}</td>
-                <td>{m.type}</td>
-                <td><span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)' }}>{m.quant}</span></td>
-                <td>{m.ctx}</td>
-                <td>{m.size}</td>
-                <td>
-                  <span className={`badge${!m.pulled ? ' warn' : ''}`}>
-                    <span className="dot" />
-                    {m.pulled ? (m.name === activeModel ? 'active' : 'ready') : 'not pulled'}
-                  </span>
-                </td>
+      {modelsLoading ? (
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 60, color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+          Loading models…
+        </div>
+      ) : models.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: 60, color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+          No models found on the cluster.
+        </div>
+      ) : (
+        <div className="pod-table-wrap">
+          <table className="pod-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Status</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {models.map(m => (
+                <tr key={m.name} onClick={() => onSelect(m.name)} style={{ cursor: 'pointer' }}>
+                  <td className={`pod-name${m.name === activeModel ? ' model' : ''}`}>{m.name}</td>
+                  <td>{m.size ?? '—'}</td>
+                  <td>
+                    <span className="badge">
+                      <span className="dot" />
+                      {m.name === activeModel ? 'active' : 'ready'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── AdminView ────────────────────────────────────────────────────────────────
+
+function AdminView({ token }: { token: string }) {
+  const [users, setUsers] = useState<any[]>([]);
+  const [adminLoading, setAdminLoading] = useState(true);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user', email: '' });
+  const [addError, setAddError] = useState('');
+  const [addLoading, setAddLoading] = useState(false);
+
+  const loadUsers = useCallback(() => {
+    setAdminLoading(true);
+    fetch(`/api/admin/users`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(data => { if (Array.isArray(data)) setUsers(data); })
+      .catch(() => {})
+      .finally(() => setAdminLoading(false));
+  }, [token]);
+
+  useEffect(() => {
+    loadUsers();
+  }, [loadUsers]);
+
+  const handleAddUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAddError('');
+    setAddLoading(true);
+    try {
+      const res = await fetch(`/api/admin/users`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(newUser),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        setAddError(d.error || 'Failed to create user');
+        return;
+      }
+      setNewUser({ username: '', password: '', role: 'user', email: '' });
+      setShowAddForm(false);
+      loadUsers();
+    } catch {
+      setAddError('Network error');
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
+  const handleDeleteUser = async (id: string) => {
+    if (!window.confirm('Delete this user?')) return;
+    await fetch(`/api/admin/users/${id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+    loadUsers();
+  };
+
+  return (
+    <div className="cluster-view">
+      <div className="cluster-head">
+        <div>
+          <div className="crumb">k3s-cluster / admin</div>
+          <h2>User Management</h2>
+        </div>
+        <button
+          onClick={() => setShowAddForm(v => !v)}
+          style={{ padding: '8px 14px', background: 'var(--bone)', color: 'var(--bone-ink)', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font-sans)' }}
+        >
+          {showAddForm ? 'Cancel' : '+ Add user'}
+        </button>
       </div>
+
+      {showAddForm && (
+        <div style={{ maxWidth: 1180, margin: '0 auto 24px', padding: 20, border: '1px solid var(--line)', borderRadius: 12, background: 'var(--bg-elev)' }}>
+          <form onSubmit={handleAddUser} style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            {[
+              { label: 'Username', key: 'username', type: 'text', placeholder: 'username' },
+              { label: 'Password', key: 'password', type: 'password', placeholder: '••••••••' },
+              { label: 'Email', key: 'email', type: 'email', placeholder: 'user@example.com' },
+            ].map(f => (
+              <div key={f.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ink-3)' }}>{f.label}</div>
+                <input
+                  type={f.type}
+                  placeholder={f.placeholder}
+                  value={(newUser as any)[f.key]}
+                  onChange={e => setNewUser(u => ({ ...u, [f.key]: e.target.value }))}
+                  required={f.key !== 'email'}
+                  style={{ background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 6, padding: '8px 12px', color: 'var(--ink)', fontSize: 13, fontFamily: 'var(--font-sans)', outline: 'none' }}
+                />
+              </div>
+            ))}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ink-3)' }}>Role</div>
+              <select
+                value={newUser.role}
+                onChange={e => setNewUser(u => ({ ...u, role: e.target.value }))}
+                style={{ background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 6, padding: '8px 12px', color: 'var(--ink)', fontSize: 13, fontFamily: 'var(--font-mono)', outline: 'none' }}
+              >
+                <option value="user">user</option>
+                <option value="admin">admin</option>
+              </select>
+            </div>
+            {addError && <div style={{ color: '#f87171', fontSize: 13, width: '100%' }}>{addError}</div>}
+            <button
+              type="submit"
+              disabled={addLoading}
+              style={{ padding: '8px 16px', background: 'var(--bone)', color: 'var(--bone-ink)', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font-sans)', opacity: addLoading ? 0.6 : 1 }}
+            >
+              {addLoading ? 'Creating…' : 'Create user'}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {adminLoading ? (
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 60, color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+          Loading users…
+        </div>
+      ) : (
+        <div className="pod-table-wrap">
+          <table className="pod-table">
+            <thead>
+              <tr>
+                <th>Username</th>
+                <th>Role</th>
+                <th>Email</th>
+                <th>Created</th>
+                <th>Last Login</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map(u => (
+                <tr key={u._id || u.id}>
+                  <td className="pod-name">{u.username}</td>
+                  <td>
+                    <span className={`badge${u.role === 'admin' ? '' : ' warn'}`} style={u.role === 'admin' ? { borderColor: 'rgba(239,231,215,0.32)', background: 'rgba(239,231,215,0.08)', color: 'var(--bone)' } : {}}>
+                      <span className="dot" />
+                      {u.role}
+                    </span>
+                  </td>
+                  <td>{u.email ?? '—'}</td>
+                  <td className="age">{u.createdAt ? new Date(u.createdAt).toLocaleDateString() : '—'}</td>
+                  <td className="age">{u.lastLogin ? new Date(u.lastLogin).toLocaleDateString() : '—'}</td>
+                  <td>
+                    <button
+                      onClick={() => handleDeleteUser(u._id || u.id)}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ink-4)', padding: '4px 6px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, fontFamily: 'var(--font-mono)' }}
+                      title="Delete user"
+                    >
+                      <IcoTrash />
+                      delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {users.length === 0 && (
+                <tr>
+                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--ink-4)', padding: 32 }}>No users found.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -1151,19 +1500,24 @@ function MobileOverlay({ onClose, messages, streaming, model, online }: MobileOv
 export default function App() {
   const hostname = window.location.hostname;
 
-  // Threads — seed + runtime
-  const [threads, setThreads] = useState<Thread[]>(() =>
-    SEED_THREADS.map(t => ({ ...t, messages: SEED_MESSAGES[t.id] ?? [] }))
-  );
-  const [activeId, setActiveId] = useState<string>('t1');
+  // ── Auth state ──
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('ollama_token'));
+  const [currentUser, setCurrentUser] = useState<{ username: string; role: string; email?: string } | null>(null);
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
 
-  // Navigation
-  const [view, setView]                     = useState<View>('chat');
+  // ── Threads ──
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [activeId, setActiveId] = useState<string>('');
+
+  // ── Navigation ──
+  const [view, setView]                       = useState<View>('chat');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [settingsOpen, setSettingsOpen]     = useState(false);
-  const [mobileOverlay, setMobileOverlay]   = useState(false);
+  const [settingsOpen, setSettingsOpen]       = useState(false);
+  const [mobileOverlay, setMobileOverlay]     = useState(false);
 
-  // Settings
+  // ── Settings ──
   const [settings, setSettings] = useState<Settings>({
     model: 'llama3:8b',
     temp: 0.7,
@@ -1173,36 +1527,86 @@ export default function App() {
     voice: false,
     system: 'You are a helpful AI assistant running on a self-hosted k3s cluster with Ollama.',
   });
-  const [density, setDensity]   = useState('regular');
-  const [theme, setTheme]       = useState<'dark' | 'light'>('dark');
+  const [density, setDensity] = useState('regular');
+  const [theme, setTheme]     = useState<'dark' | 'light'>('dark');
 
-  // Chat state
+  // ── Chat state ──
   const [input, setInput]             = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [loading, setLoading]         = useState(false);
   const [streamText, setStreamText]   = useState('');
 
-  // Cluster health
+  // ── Cluster health ──
   const [clusterOnline, setClusterOnline] = useState(false);
+  const [podCount, setPodCount]           = useState(0);
+  const [podTotal, setPodTotal]           = useState(0);
 
-  // STT
+  // ── STT ──
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Apply theme + density to documentElement
+  // Apply theme + density
   useEffect(() => {
     document.documentElement.dataset.theme   = theme;
     document.documentElement.dataset.density = density;
   }, [theme, density]);
 
-  // Health poll every 5s
+  // ── Validate token on mount (once) ──
+  useEffect(() => {
+    if (!token) return;
+    fetch(`/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => {
+        if (!r.ok) {
+          localStorage.removeItem('ollama_token');
+          setToken(null);
+          return null;
+        }
+        return r.json();
+      })
+      .then(u => { if (u) setCurrentUser(u); })
+      .catch(() => setToken(null));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Load conversations when token is available ──
+  useEffect(() => {
+    if (!token) return;
+    fetch(`/api/conversations`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.json())
+      .then(convs => {
+        if (Array.isArray(convs)) {
+          setThreads(convs.map(apiToThread));
+          if (convs.length > 0) setActiveId(convs[0]._id);
+        }
+      })
+      .catch(() => {});
+  }, [token]);
+
+  // ── Health poll every 5s ──
   useEffect(() => {
     const check = async () => {
       try {
-        const r = await fetch(`http://${hostname}:5000/health`);
+        const r = await fetch(`/health`);
         setClusterOnline(r.ok);
+        if (r.ok && token) {
+          // Update pod counts from cluster status
+          fetch(`/api/cluster/status`, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+            .then(rr => rr.json())
+            .then(data => {
+              if (data.pods) {
+                setPodTotal(data.pods.length);
+                setPodCount(data.pods.filter((p: any) => p.status === 'Running').length);
+              }
+            })
+            .catch(() => {});
+        }
       } catch {
         setClusterOnline(false);
       }
@@ -1210,36 +1614,134 @@ export default function App() {
     check();
     const id = setInterval(check, 5000);
     return () => clearInterval(id);
-  }, [hostname]);
+  }, [token]);
 
-  // Scroll to bottom
+  // ── Scroll to bottom ──
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [threads, streamText]);
 
   const activeThread = useMemo(() => threads.find(t => t.id === activeId), [threads, activeId]);
 
-  // ── Thread management ──
+  // ── Login ──
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError('');
+    setLoginLoading(true);
+    try {
+      const res = await fetch(`/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        setLoginError(d.error || d.message || 'Invalid credentials');
+        return;
+      }
+      const data = await res.json();
+      const tok = data.token;
+      localStorage.setItem('ollama_token', tok);
+      setToken(tok);
+      if (data.user) setCurrentUser(data.user);
+      // Load conversations
+      fetch(`/api/conversations`, {
+        headers: { Authorization: `Bearer ${tok}` },
+      })
+        .then(r => r.json())
+        .then(convs => {
+          if (Array.isArray(convs)) {
+            setThreads(convs.map(apiToThread));
+            if (convs.length > 0) setActiveId(convs[0]._id);
+          }
+        })
+        .catch(() => {});
+    } catch {
+      setLoginError('Network error. Check backend connection.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
 
-  const handleNewChat = useCallback(() => {
-    const id = genId();
-    const t: Thread = {
-      id,
-      title: 'New chat',
-      model: settings.model,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      group: 'Today',
-      messages: [],
-    };
-    setThreads(prev => [t, ...prev]);
+  // ── Logout ──
+  const handleLogout = () => {
+    localStorage.removeItem('ollama_token');
+    setToken(null);
+    setCurrentUser(null);
+    setThreads([]);
+    setActiveId('');
+  };
+
+  // ── New chat ──
+  const handleNewChat = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(`/api/conversations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: settings.model }),
+      });
+      const conv = await res.json();
+      const t = apiToThread(conv);
+      setThreads(prev => [t, ...prev]);
+      setActiveId(conv._id);
+      setView('chat');
+    } catch {
+      // Fallback: create a local-only thread
+      const id = genId();
+      const t: Thread = {
+        id,
+        title: 'New conversation',
+        model: settings.model,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        group: 'Today',
+        messages: [],
+      };
+      setThreads(prev => [t, ...prev]);
+      setActiveId(id);
+      setView('chat');
+    }
+  }, [token, hostname, settings.model]);
+
+  // ── Select thread (lazy-load messages) ──
+  const handleSelectThread = useCallback(async (id: string) => {
     setActiveId(id);
     setView('chat');
-  }, [settings.model]);
+    // Lazy-load messages if not yet loaded
+    const thread = threads.find(t => t.id === id);
+    if (thread && thread.messages.length === 0 && token) {
+      try {
+        const res = await fetch(`/api/conversations/${id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const conv = await res.json();
+        const messages = (conv.messages || []).map(apiMsgToLocal);
+        setThreads(prev => prev.map(t => t.id === id ? { ...t, messages } : t));
+      } catch {
+        // ignore
+      }
+    }
+  }, [threads, token, hostname]);
 
-  const handleSelectThread = useCallback((id: string) => {
-    setActiveId(id);
-    setView('chat');
-  }, []);
+  // ── Delete thread ──
+  const handleDeleteThread = useCallback(async (id: string) => {
+    if (!token) return;
+    await fetch(`/api/conversations/${id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+    setThreads(prev => {
+      const next = prev.filter(t => t.id !== id);
+      return next;
+    });
+    if (activeId === id) {
+      setThreads(prev => {
+        const next = prev.filter(t => t.id !== id);
+        setActiveId(next[0]?.id ?? '');
+        return next;
+      });
+    }
+  }, [token, hostname, activeId]);
 
   const addMessage = useCallback((threadId: string, msg: ChatMessage) => {
     setThreads(prev => prev.map(t =>
@@ -1248,7 +1750,6 @@ export default function App() {
   }, []);
 
   // ── Simulate word-by-word streaming ──
-
   const simulateStream = useCallback((text: string): Promise<void> => {
     return new Promise(resolve => {
       const words = text.split(' ');
@@ -1262,7 +1763,7 @@ export default function App() {
         }
         setStreamText(words.slice(0, i + 1).join(' '));
         i++;
-        const delay = 16 + Math.random() * 14; // 16-30ms
+        const delay = 16 + Math.random() * 14;
         setTimeout(tick, delay);
       };
       tick();
@@ -1270,11 +1771,30 @@ export default function App() {
   }, []);
 
   // ── Send message ──
-
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
-    if (!activeThread) return;
+    if (!token) return;
+
+    let currentActiveId = activeId;
+
+    // If no active conversation, create one first
+    if (!currentActiveId) {
+      try {
+        const res = await fetch(`/api/conversations`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: settings.model }),
+        });
+        const conv = await res.json();
+        const newThread = apiToThread(conv);
+        setThreads(prev => [newThread, ...prev]);
+        setActiveId(conv._id);
+        currentActiveId = conv._id;
+      } catch {
+        return;
+      }
+    }
 
     const userMsg: ChatMessage = {
       id: genId(),
@@ -1283,16 +1803,8 @@ export default function App() {
       attachments: attachments.length > 0 ? [...attachments] : undefined,
     };
 
-    // Auto-title the thread on first user message
-    if (activeThread.messages.length === 0 && text) {
-      setThreads(prev => prev.map(t =>
-        t.id === activeId
-          ? { ...t, title: text.slice(0, 46) + (text.length > 46 ? '…' : ''), model: settings.model }
-          : t
-      ));
-    }
-
-    addMessage(activeId, userMsg);
+    // Optimistically add user message
+    addMessage(currentActiveId, userMsg);
     setInput('');
     setAttachments([]);
     setLoading(true);
@@ -1300,12 +1812,10 @@ export default function App() {
     const hasImage = attachments.some(a => a.kind === 'image');
     const routedModel = hasImage ? 'llava:7b' : settings.model;
 
-    // Try real backend, fall back to canned response
     let replyText = '';
     let latency = '';
-    let pod = 'pod/x2p7q';
-
     const t0 = Date.now();
+
     try {
       const formData = new FormData();
       formData.append('message', text);
@@ -1319,10 +1829,14 @@ export default function App() {
         if (a.kind === 'image' && a.dataUrl) formData.append('images', a.dataUrl);
       });
 
-      const res = await fetch(`http://${hostname}:5000/api/chat`, {
-        method: 'POST',
-        body: formData,
-      });
+      const res = await fetch(
+        `/api/conversations/${currentActiveId}/messages`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData,
+        }
+      );
 
       if (!res.ok) {
         let errMsg = `Backend error (HTTP ${res.status})`;
@@ -1334,7 +1848,16 @@ export default function App() {
       }
       const data = await res.json();
       replyText = data.reply || data.message || data.content || 'No response.';
-      latency = `${Date.now() - t0}ms`;
+      latency = data.latency ? `${data.latency}` : `${Date.now() - t0}ms`;
+
+      // Update thread title if it was 'New conversation'
+      if (text) {
+        setThreads(prev => prev.map(t =>
+          t.id === currentActiveId && (t.title === 'New conversation' || t.title === '')
+            ? { ...t, title: text.slice(0, 46) + (text.length > 46 ? '…' : ''), model: routedModel }
+            : t
+        ));
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       replyText = `**Error:** Could not get a response from \`${routedModel}\`.\n\n\`${msg}\`\n\nCheck that the model is pulled on the cluster (see **Models** view), or select a different model in Settings.`;
@@ -1348,10 +1871,9 @@ export default function App() {
       role: 'assistant',
       model: routedModel,
       latency,
-      pod,
       content: replyText,
     };
-    addMessage(activeId, assistantMsg);
+    addMessage(currentActiveId, assistantMsg);
 
     if (settings.voice && window.speechSynthesis) {
       const utt = new SpeechSynthesisUtterance(replyText.slice(0, 400));
@@ -1359,10 +1881,9 @@ export default function App() {
     }
 
     setLoading(false);
-  }, [input, attachments, activeThread, activeId, settings, hostname, addMessage, simulateStream]);
+  }, [input, attachments, activeId, token, settings, hostname, addMessage, simulateStream]);
 
   // ── Attach files ──
-
   const handleAttach = useCallback((files: FileList) => {
     const newAtts: Attachment[] = [];
     Array.from(files).forEach(file => {
@@ -1387,7 +1908,6 @@ export default function App() {
   }, []);
 
   // ── STT ──
-
   const toggleMic = useCallback(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) return;
@@ -1412,7 +1932,6 @@ export default function App() {
   }, [isListening]);
 
   // ── TTS ──
-
   const handleSpeak = useCallback((text: string) => {
     if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
@@ -1425,22 +1944,32 @@ export default function App() {
   }, []);
 
   // ── Suggest click ──
-
   const handleSuggest = useCallback((text: string) => {
     setInput(text);
     setView('chat');
   }, []);
 
   // ── Model select from Models view ──
-
   const handleModelSelect = useCallback((m: string) => {
     setSettings(s => ({ ...s, model: m }));
     setView('chat');
   }, []);
 
-  const runningPods = POD_ROWS.filter(p => p.status === 'Running').length;
-  const messages    = activeThread?.messages ?? [];
-  const hasImages   = attachments.some(a => a.kind === 'image');
+  const messages  = activeThread?.messages ?? [];
+  const hasImages = attachments.some(a => a.kind === 'image');
+
+  // ── Not logged in → show login page ──
+  if (!token) {
+    return (
+      <LoginPage
+        form={loginForm}
+        onChange={setLoginForm}
+        onSubmit={handleLogin}
+        error={loginError}
+        loading={loginLoading}
+      />
+    );
+  }
 
   return (
     <div className={`app${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
@@ -1450,14 +1979,15 @@ export default function App() {
         view={view}
         onViewChange={setView}
         clusterOnline={clusterOnline}
-        podCount={runningPods}
-        podTotal={POD_ROWS.length}
+        podCount={podCount}
+        podTotal={podTotal}
         settings={settings}
         onSettingsOpen={() => setSettingsOpen(true)}
         theme={theme}
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         onMobileOverlay={() => setMobileOverlay(true)}
         activeThread={activeThread}
+        currentUser={currentUser}
       />
 
       {!sidebarCollapsed && (
@@ -1467,14 +1997,24 @@ export default function App() {
           activeId={activeId}
           onSelect={handleSelectThread}
           onNewChat={handleNewChat}
+          onDeleteThread={handleDeleteThread}
           view={view}
           onViewChange={setView}
+          currentUser={currentUser}
+          onLogout={handleLogout}
         />
       )}
 
       <main className="main">
-        {view === 'cluster' && <ClusterView online={clusterOnline} />}
-        {view === 'models'  && <ModelsView activeModel={settings.model} onSelect={handleModelSelect} />}
+        {view === 'cluster' && (
+          <ClusterView online={clusterOnline} token={token} />
+        )}
+        {view === 'models' && (
+          <ModelsView activeModel={settings.model} onSelect={handleModelSelect} token={token} />
+        )}
+        {view === 'admin' && currentUser?.role === 'admin' && (
+          <AdminView token={token} />
+        )}
 
         {view === 'chat' && (
           <>
@@ -1485,7 +2025,6 @@ export default function App() {
                 )}
 
                 {messages.map((msg, idx) => {
-                  // Check if the previous user message had images
                   const prevUserMsg = idx > 0 && messages[idx - 1].role === 'user'
                     ? messages[idx - 1]
                     : null;
