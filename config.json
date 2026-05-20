@@ -53,10 +53,22 @@
     "port": 5000,
     "jwt_secret": "change-this-in-production-use-a-long-random-string-32chars",
     "jwt_expiry": "24h",
-    "max_upload_size": "50mb"
+    "max_upload_size": "50mb",
+    "smtp": {
+      "host": "",
+      "port": 587,
+      "user": "",
+      "pass": "",
+      "from": "noreply@ollama.local"
+    }
   },
   "frontend": {
     "port": 3000
+  },
+  "local": {
+    "web_port": 8080,
+    "ollama_port": 11434,
+    "backend_port": 5000
   },
   "users": [
     {

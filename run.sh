@@ -1,34 +1,22 @@
 #!/usr/bin/env bash
-# run.sh — Ollama Cluster management script
-# Usage: ./run.sh <command> [args]
-#
-# Commands:
-#   setup             Install K3s, MongoDB, Ollama, backend, frontend
-#   uninstall         Remove everything from all nodes
-#   status            Show cluster, models, and user status
-#   sync-models       Pull models in config; remove models not in config
-#   sync-users        Create all users from config.json into MongoDB
-#   add-user <name>   Add a specific user from config.json to MongoDB
-#   remove-user <name> Remove a user from MongoDB (and their conversations)
-#   deploy-backend    Reinstall deps and restart backend
-#   deploy-frontend   Rebuild React app and deploy to nginx
-#   logs              Tail backend logs
+# run.sh — Ollama Chat Manager (local & cluster modes)
+# Usage: ./run.sh [--local|--cluster] <command> [args]
 
 set -euo pipefail
 
-# ─── Load config ────────────────────────────────────────────────────────────
+# ─── Paths ───────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.json"
+MODE_FILE="$SCRIPT_DIR/.run-mode"
+BACKEND_DIR="$SCRIPT_DIR/chat-app/backend"
+FRONTEND_DIR="$SCRIPT_DIR/chat-app/frontend"
 
-if [[ ! -f "$CONFIG" ]]; then
-  echo "ERROR: config.json not found at $CONFIG"
-  exit 1
-fi
+[[ ! -f "$CONFIG" ]] && { echo "ERROR: config.json not found at $CONFIG"; exit 1; }
 
-_cfg() {
-  python3 -c "import json,sys; d=json.load(open('$CONFIG')); print(d$1)" 2>/dev/null || echo ""
-}
+# ─── Config helpers ───────────────────────────────────────────────────────────
+
+_cfg() { python3 -c "import json,sys; d=json.load(open('$CONFIG')); print(d$1)" 2>/dev/null || echo ""; }
 
 MASTER_IP=$(_cfg "['cluster']['master']['ip']")
 WORKER_IP=$(_cfg "['cluster']['worker']['ip']")
@@ -50,32 +38,606 @@ MONGO_PASS=$(_cfg "['mongodb']['password']")
 BACKEND_PORT=$(_cfg "['backend']['port']")
 BACKEND_JWT=$(_cfg "['backend']['jwt_secret']")
 BACKEND_JWT_EXP=$(_cfg "['backend']['jwt_expiry']")
+SMTP_HOST=$(_cfg "['backend']['smtp']['host']")
+SMTP_PORT=$(_cfg "['backend']['smtp']['port']")
+SMTP_USER=$(_cfg "['backend']['smtp']['user']")
+SMTP_PASS=$(_cfg "['backend']['smtp']['pass']")
+SMTP_FROM=$(_cfg "['backend']['smtp']['from']")
 
-FRONTEND_PORT=$(_cfg "['frontend']['port']")
+LOCAL_WEB_PORT=$(_cfg "['local']['web_port']")
+LOCAL_OLLAMA_PORT=$(_cfg "['local']['ollama_port']")
+LOCAL_BACKEND_PORT=$(_cfg "['local']['backend_port']")
 
 SSH="sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no $SSH_USER"
 SCP="sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no"
 
-BACKEND_DIR="$SCRIPT_DIR/chat-app/backend"
-FRONTEND_DIR="$SCRIPT_DIR/chat-app/frontend"
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Display helpers ──────────────────────────────────────────────────────────
 
 log()  { echo -e "\033[1;36m▶ $*\033[0m"; }
 ok()   { echo -e "\033[1;32m✓ $*\033[0m"; }
 warn() { echo -e "\033[1;33m⚠ $*\033[0m"; }
 err()  { echo -e "\033[1;31m✗ $*\033[0m"; exit 1; }
+hdr()  { echo -e "\n\033[1;35m━━━ $* ━━━\033[0m"; }
 
-check_deps() {
-  for cmd in sshpass python3 npm node tar; do
+# ─── Mode selection ───────────────────────────────────────────────────────────
+
+MODE=""
+
+# Parse leading --local / --cluster flag
+if [[ "${1:-}" == "--local" ]]; then
+  MODE="local"; shift
+elif [[ "${1:-}" == "--cluster" ]]; then
+  MODE="cluster"; shift
+fi
+
+# Fall back to saved mode
+if [[ -z "$MODE" && -f "$MODE_FILE" ]]; then
+  MODE=$(cat "$MODE_FILE")
+fi
+
+# Interactive prompt if still unknown
+if [[ -z "$MODE" ]]; then
+  echo ""
+  echo "  ┌─────────────────────────────────────────────┐"
+  echo "  │        Ollama Chat — Install Mode            │"
+  echo "  ├─────────────────────────────────────────────┤"
+  echo "  │  1) local    — Ubuntu machine with GPU       │"
+  echo "  │               (installs Ollama, Mongo,       │"
+  echo "  │                Node.js, nginx locally)       │"
+  echo "  │                                              │"
+  echo "  │  2) cluster  — Two-node K3s cluster          │"
+  echo "  │               (172.16.9.203 + 172.16.9.253)  │"
+  echo "  └─────────────────────────────────────────────┘"
+  echo ""
+  read -rp "  Choose mode [1=local / 2=cluster]: " _choice
+  case "$_choice" in
+    1|local)   MODE="local"   ;;
+    2|cluster) MODE="cluster" ;;
+    *) err "Invalid choice. Use 1 or 2." ;;
+  esac
+  echo "$MODE" > "$MODE_FILE"
+  ok "Mode saved to .run-mode (override anytime with --local or --cluster)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOCAL MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── GPU detection ─────────────────────────────────────────────────────────────
+
+detect_gpu() {
+  if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    echo "nvidia"
+  elif command -v rocm-smi &>/dev/null && rocm-smi &>/dev/null; then
+    echo "amd"
+  else
+    echo "cpu"
+  fi
+}
+
+# ── Local: install system dependencies ───────────────────────────────────────
+
+local_install_deps() {
+  hdr "Installing system dependencies"
+
+  log "Updating apt..."
+  apt-get update -qq
+
+  # Node.js 20
+  if ! command -v node &>/dev/null || [[ "$(node --version | cut -d. -f1 | tr -d v)" -lt 20 ]]; then
+    log "Installing Node.js 20..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - -qq
+    apt-get install -y -qq nodejs
+    ok "Node.js $(node --version) installed"
+  else
+    ok "Node.js $(node --version) already installed"
+  fi
+
+  # MongoDB 7
+  if ! command -v mongod &>/dev/null; then
+    log "Installing MongoDB 7..."
+    curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | \
+      gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+    echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] \
+https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/7.0 multiverse" \
+      > /etc/apt/sources.list.d/mongodb-org-7.0.list
+    apt-get update -qq
+    apt-get install -y -qq mongodb-org
+    systemctl enable --now mongod
+    ok "MongoDB 7 installed"
+  else
+    ok "MongoDB already installed: $(mongod --version 2>&1 | head -1)"
+  fi
+
+  # nginx
+  if ! command -v nginx &>/dev/null; then
+    log "Installing nginx..."
+    apt-get install -y -qq nginx
+    ok "nginx installed"
+  else
+    ok "nginx already installed"
+  fi
+
+  # Ollama
+  if ! command -v ollama &>/dev/null; then
+    log "Installing Ollama..."
+    curl -fsSL https://ollama.ai/install.sh | sh
+    ok "Ollama installed"
+  else
+    ok "Ollama already installed: $(ollama --version 2>&1)"
+  fi
+
+  # GPU setup
+  GPU=$(detect_gpu)
+  case "$GPU" in
+    nvidia) ok "NVIDIA GPU detected — Ollama will use CUDA" ;;
+    amd)    ok "AMD GPU detected — Ollama will use ROCm" ;;
+    cpu)    warn "No GPU detected — Ollama will run on CPU (slower)" ;;
+  esac
+
+  # Start Ollama service
+  if ! systemctl is-active --quiet ollama 2>/dev/null; then
+    log "Starting Ollama service..."
+    if [[ -f /etc/systemd/system/ollama.service ]]; then
+      systemctl enable --now ollama
+    else
+      # Create service if installer didn't
+      cat > /etc/systemd/system/ollama.service <<OLLAMASVC
+[Unit]
+Description=Ollama AI Service
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=3
+Environment=OLLAMA_HOST=0.0.0.0
+
+[Install]
+WantedBy=multi-user.target
+OLLAMASVC
+      systemctl daemon-reload
+      systemctl enable --now ollama
+    fi
+  fi
+  ok "Ollama service running on port $LOCAL_OLLAMA_PORT"
+
+  # Misc tools
+  apt-get install -y -qq curl python3 git 2>/dev/null || true
+}
+
+# ── Local: configure MongoDB auth ─────────────────────────────────────────────
+
+local_configure_mongo() {
+  hdr "Configuring MongoDB"
+
+  # Wait for mongod to be up
+  local retries=15
+  while ! mongosh --quiet --eval "db.adminCommand('ping')" &>/dev/null && [[ $retries -gt 0 ]]; do
+    sleep 2; ((retries--))
+  done
+  [[ $retries -eq 0 ]] && err "MongoDB did not start in time"
+
+  # Create admin user if not exists
+  mongosh --quiet admin --eval "
+    try {
+      db.createUser({
+        user: '$MONGO_USER',
+        pwd: '$MONGO_PASS',
+        roles: [{role:'root',db:'admin'}]
+      });
+      print('MongoDB admin user created');
+    } catch(e) {
+      print('User may already exist: ' + e.message);
+    }
+  " 2>/dev/null || true
+
+  ok "MongoDB configured (user: $MONGO_USER, db: $MONGO_DB)"
+}
+
+# ── Local: write nginx config ─────────────────────────────────────────────────
+
+local_configure_nginx() {
+  hdr "Configuring nginx"
+
+  cat > /etc/nginx/sites-available/ollama-chat <<NGINXCONF
+server {
+    listen $LOCAL_WEB_PORT;
+    server_name _;
+
+    root /var/www/ollama-chat;
+    index index.html;
+
+    # SPA fallback
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    # API proxy
+    location /api/ {
+        proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 300s;
+        client_max_body_size 50m;
+    }
+
+    # Upload proxy
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
+    }
+}
+NGINXCONF
+
+  ln -sf /etc/nginx/sites-available/ollama-chat /etc/nginx/sites-enabled/ollama-chat
+  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+  nginx -t && systemctl enable --now nginx && systemctl reload nginx
+  ok "nginx configured on port $LOCAL_WEB_PORT"
+}
+
+# ── Local: write backend systemd service ──────────────────────────────────────
+
+local_write_backend_service() {
+  hdr "Writing backend systemd service"
+
+  # Build MONGO_URI without auth if password is empty (dev mode)
+  local MONGO_URI="mongodb://$MONGO_USER:$MONGO_PASS@127.0.0.1:27017/$MONGO_DB?authSource=admin"
+
+  cat > /etc/systemd/system/ollama-backend.service <<SVCONF
+[Unit]
+Description=Ollama Chat Backend
+After=network.target mongod.service
+
+[Service]
+Type=simple
+WorkingDirectory=$BACKEND_DIR
+ExecStart=$(command -v node) server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=$LOCAL_BACKEND_PORT
+Environment=OLLAMA_URL=http://127.0.0.1:$LOCAL_OLLAMA_PORT/api/chat
+Environment=OLLAMA_BASE=http://127.0.0.1:$LOCAL_OLLAMA_PORT
+Environment=MONGO_URI=$MONGO_URI
+Environment=JWT_SECRET=$BACKEND_JWT
+Environment=JWT_EXPIRY=$BACKEND_JWT_EXP
+Environment=SMTP_HOST=$SMTP_HOST
+Environment=SMTP_PORT=$SMTP_PORT
+Environment=SMTP_USER=$SMTP_USER
+Environment=SMTP_PASS=$SMTP_PASS
+Environment=SMTP_FROM=$SMTP_FROM
+
+[Install]
+WantedBy=multi-user.target
+SVCONF
+
+  systemctl daemon-reload
+  ok "Backend service written"
+}
+
+# ── Local: full setup ─────────────────────────────────────────────────────────
+
+local_setup() {
+  [[ "$(id -u)" -ne 0 ]] && err "Local setup must run as root (sudo ./run.sh setup)"
+
+  log "Starting local install on $(hostname)"
+  local_install_deps
+  local_configure_mongo
+  local_deploy_backend
+  local_configure_nginx
+  local_deploy_frontend
+  sleep 3
+  local_sync_users
+
+  hdr "Setup complete"
+  local LOCAL_IP
+  LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+  ok "Web UI:    http://$LOCAL_IP:$LOCAL_WEB_PORT"
+  ok "Backend:   http://127.0.0.1:$LOCAL_BACKEND_PORT"
+  ok "Ollama:    http://127.0.0.1:$LOCAL_OLLAMA_PORT"
+  ok "MongoDB:   mongodb://127.0.0.1:27017/$MONGO_DB"
+}
+
+# ── Local: deploy backend ─────────────────────────────────────────────────────
+
+local_deploy_backend() {
+  hdr "Deploying backend"
+  log "Installing npm dependencies..."
+  (cd "$BACKEND_DIR" && npm install --production --silent)
+  local_write_backend_service
+  systemctl enable ollama-backend
+  systemctl restart ollama-backend
+  # Wait for it to be up
+  local retries=20
+  while ! curl -sf "http://127.0.0.1:$LOCAL_BACKEND_PORT/health" &>/dev/null && [[ $retries -gt 0 ]]; do
+    sleep 2; ((retries--))
+  done
+  if curl -sf "http://127.0.0.1:$LOCAL_BACKEND_PORT/health" &>/dev/null; then
+    ok "Backend running at http://127.0.0.1:$LOCAL_BACKEND_PORT"
+  else
+    warn "Backend may still be starting — check: journalctl -u ollama-backend -f"
+  fi
+}
+
+# ── Local: deploy frontend ────────────────────────────────────────────────────
+
+local_deploy_frontend() {
+  hdr "Building and deploying frontend"
+  log "Installing npm dependencies..."
+  (cd "$FRONTEND_DIR" && npm install --silent)
+  log "Building React app..."
+  (cd "$FRONTEND_DIR" && npm run build)
+  mkdir -p /var/www/ollama-chat
+  rm -rf /var/www/ollama-chat/*
+  cp -r "$FRONTEND_DIR/build/." /var/www/ollama-chat/
+  systemctl reload nginx 2>/dev/null || true
+  ok "Frontend deployed to /var/www/ollama-chat"
+}
+
+# ── Local: sync models ────────────────────────────────────────────────────────
+
+local_sync_models() {
+  hdr "Syncing Ollama models"
+  local MODELS
+  MODELS=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for m in d['ollama']['models']:
+    print(m)
+")
+
+  # Wait for Ollama to be ready
+  local retries=15
+  while ! curl -sf "http://127.0.0.1:$LOCAL_OLLAMA_PORT/api/tags" &>/dev/null && [[ $retries -gt 0 ]]; do
+    sleep 3; ((retries--))
+  done
+
+  for MODEL in $MODELS; do
+    INSTALLED=$(curl -s "http://127.0.0.1:$LOCAL_OLLAMA_PORT/api/tags" | \
+      python3 -c "import json,sys; models=[m['name'] for m in json.load(sys.stdin).get('models',[])]; print('1' if any(m.startswith('$MODEL') for m in models) else '0')" 2>/dev/null || echo "0")
+    if [[ "$INSTALLED" == "0" ]]; then
+      log "Pulling $MODEL..."
+      ollama pull "$MODEL" &
+    else
+      ok "$MODEL already present"
+    fi
+  done
+  wait
+  ok "Model sync complete"
+}
+
+# ── Local: status ─────────────────────────────────────────────────────────────
+
+local_status() {
+  hdr "Local Service Status"
+
+  # GPU
+  GPU=$(detect_gpu)
+  echo "  GPU: $GPU"
+  echo ""
+
+  # Services
+  for svc in ollama ollama-backend nginx mongod; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      ok "  $svc — active"
+    else
+      warn "  $svc — inactive"
+    fi
+  done
+  echo ""
+
+  # Ollama models
+  hdr "Installed Models"
+  curl -s "http://127.0.0.1:$LOCAL_OLLAMA_PORT/api/tags" 2>/dev/null | \
+    python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+models = data.get('models', [])
+if models:
+    for m in models:
+        size = round(m.get('size',0)/1e9, 1)
+        print(f'  {m[\"name\"]:40s} {size} GB')
+else:
+    print('  (no models installed)')
+" 2>/dev/null || warn "Ollama not reachable"
+  echo ""
+
+  # Health
+  hdr "Backend Health"
+  curl -s "http://127.0.0.1:$LOCAL_BACKEND_PORT/health" 2>/dev/null | \
+    python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+print(f'  status:  {d.get(\"status\",\"?\")}')
+print(f'  mongodb: {d.get(\"mongo\",\"?\")}')
+print(f'  ollama:  {d.get(\"ollama\",\"?\")}')
+" 2>/dev/null || warn "Backend not reachable at http://127.0.0.1:$LOCAL_BACKEND_PORT/health"
+}
+
+# ── Local: logs ───────────────────────────────────────────────────────────────
+
+local_logs() {
+  local svc="${1:-ollama-backend}"
+  log "Tailing $svc logs (Ctrl+C to stop)..."
+  journalctl -u "$svc" -f --no-hostname --output=short-iso
+}
+
+# ── Local: restart ────────────────────────────────────────────────────────────
+
+local_restart() {
+  local target="${1:-all}"
+  if [[ "$target" == "all" || "$target" == "backend" ]]; then
+    systemctl restart ollama-backend && ok "Backend restarted"
+  fi
+  if [[ "$target" == "all" || "$target" == "nginx" ]]; then
+    systemctl reload nginx && ok "nginx reloaded"
+  fi
+  if [[ "$target" == "all" || "$target" == "ollama" ]]; then
+    systemctl restart ollama && ok "Ollama restarted"
+  fi
+}
+
+# ── Local: sync users ─────────────────────────────────────────────────────────
+
+local_sync_users() {
+  log "Syncing users from config.json..."
+  local USERS
+  USERS=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for u in d['users']:
+    print(u['username'], u['password'], u.get('role','user'), u.get('email',''))
+")
+  local TOKEN
+  TOKEN=$(local_get_admin_token)
+  while IFS=' ' read -r username password role email; do
+    [[ -z "$username" ]] && continue
+    RESULT=$(curl -s -X POST "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/admin/users" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d "{\"username\":\"$username\",\"password\":\"$password\",\"role\":\"$role\",\"email\":\"$email\"}" 2>/dev/null)
+    if echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if 'id' in d or 'already' in d.get('error','') else 1)" 2>/dev/null; then
+      ok "User '$username' ($role) ready"
+    else
+      warn "User '$username': $RESULT"
+    fi
+  done <<< "$USERS"
+}
+
+local_get_admin_token() {
+  local ADMIN_CREDS ADMIN_USER ADMIN_PASS TOKEN
+  ADMIN_CREDS=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for u in d['users']:
+    if u.get('role') == 'admin':
+        print(u['username'], u['password'])
+        break
+")
+  ADMIN_USER=$(echo "$ADMIN_CREDS" | awk '{print $1}')
+  ADMIN_PASS=$(echo "$ADMIN_CREDS" | awk '{print $2}')
+  TOKEN=$(curl -s -X POST "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" 2>/dev/null | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo "")
+  if [[ -z "$TOKEN" ]]; then
+    TOKEN=$(local_bootstrap_admin "$ADMIN_USER" "$ADMIN_PASS")
+  fi
+  echo "$TOKEN"
+}
+
+local_bootstrap_admin() {
+  local user="$1" pass="$2"
+  # Insert admin directly via mongosh (first-time setup when DB is empty)
+  local HASH
+  HASH=$(python3 -c "
+import subprocess, sys
+try:
+    import bcrypt
+    h = bcrypt.hashpw('$pass'.encode(), bcrypt.gensalt(12)).decode()
+    print(h)
+except ImportError:
+    r = subprocess.run(['node','-e',
+        \"const b=require('bcryptjs');b.hash('$pass',12).then(h=>process.stdout.write(h))\"],
+        capture_output=True, text=True, cwd='$BACKEND_DIR')
+    print(r.stdout.strip())
+" 2>/dev/null || echo "")
+
+  if [[ -n "$HASH" ]]; then
+    mongosh --quiet "$MONGO_DB" \
+      -u "$MONGO_USER" -p "$MONGO_PASS" --authenticationDatabase admin \
+      --eval "
+db.users.updateOne(
+  {username: '$user'},
+  {\$setOnInsert: {username:'$user', passwordHash:'$HASH', role:'admin', createdAt: new Date()}},
+  {upsert: true}
+);" 2>/dev/null || true
+  fi
+
+  # Retry login
+  curl -s -X POST "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"$user\",\"password\":\"$pass\"}" 2>/dev/null | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo ""
+}
+
+local_add_user() {
+  local target_user="${1:-}"
+  [[ -z "$target_user" ]] && { echo "Usage: ./run.sh add-user <username>"; exit 1; }
+  local USER_DATA
+  USER_DATA=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for u in d['users']:
+    if u['username'] == '$target_user':
+        print(u['username'], u['password'], u.get('role','user'), u.get('email',''))
+        break
+")
+  [[ -z "$USER_DATA" ]] && err "User '$target_user' not found in config.json"
+  local username password role email
+  read -r username password role email <<< "$USER_DATA"
+  local TOKEN; TOKEN=$(local_get_admin_token)
+  RESULT=$(curl -s -X POST "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/admin/users" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"username\":\"$username\",\"password\":\"$password\",\"role\":\"$role\",\"email\":\"$email\"}")
+  echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print('Created:', d.get('username',''), d.get('role',''), '|', d.get('error',''))" 2>/dev/null
+  ok "Done"
+}
+
+local_remove_user() {
+  local target_user="${1:-}"
+  [[ -z "$target_user" ]] && { echo "Usage: ./run.sh remove-user <username>"; exit 1; }
+  local TOKEN; TOKEN=$(local_get_admin_token)
+  USER_ID=$(curl -s "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/admin/users" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null | \
+    python3 -c "import json,sys; users=json.load(sys.stdin); print(next((u['_id'] for u in users if u['username']=='$target_user'),''))" 2>/dev/null)
+  [[ -z "$USER_ID" ]] && err "User '$target_user' not found in the database"
+  curl -s -X DELETE "http://127.0.0.1:$LOCAL_BACKEND_PORT/api/admin/users/$USER_ID" \
+    -H "Authorization: Bearer $TOKEN" >/dev/null
+  ok "User '$target_user' removed"
+}
+
+local_uninstall() {
+  warn "This will remove nginx config, backend service, and frontend files."
+  warn "MongoDB data and Ollama models will NOT be deleted."
+  read -rp "Type 'yes' to confirm: " confirm
+  [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
+
+  systemctl stop ollama-backend 2>/dev/null || true
+  systemctl disable ollama-backend 2>/dev/null || true
+  rm -f /etc/systemd/system/ollama-backend.service
+  systemctl daemon-reload
+
+  rm -f /etc/nginx/sites-enabled/ollama-chat
+  rm -f /etc/nginx/sites-available/ollama-chat
+  systemctl reload nginx 2>/dev/null || true
+
+  rm -rf /var/www/ollama-chat
+
+  rm -f "$MODE_FILE"
+
+  ok "Local deployment removed"
+  warn "To also remove MongoDB: sudo apt-get purge mongodb-org*"
+  warn "To also remove Ollama:  sudo systemctl stop ollama && sudo rm /usr/local/bin/ollama"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLUSTER MODE  (K3s)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cluster_check_deps() {
+  for cmd in sshpass python3 npm node tar docker; do
     command -v "$cmd" >/dev/null 2>&1 || err "Required tool '$cmd' not found. Install it first."
   done
 }
 
 remote_master() { $SSH $MASTER_IP "$@"; }
 remote_worker() { $SSH $WORKER_IP "$@"; }
-
-# ─── K8s Manifests (inline) ──────────────────────────────────────────────────
 
 OLLAMA_MANIFEST=$(cat <<EOF
 apiVersion: apps/v1
@@ -189,128 +751,6 @@ spec:
 EOF
 )
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
-
-cmd_setup() {
-  check_deps
-  log "Setting up Ollama Cluster on $MASTER_IP + $WORKER_IP"
-
-  # ── 1. Install K3s on master ──
-  log "Installing K3s on master ($MASTER_IP)..."
-  remote_master "curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -" || true
-  sleep 10
-  remote_master "k3s kubectl get nodes" || warn "K3s may already be running"
-  ok "K3s master ready"
-
-  # ── 2. Install K3s agent on worker ──
-  log "Installing K3s agent on worker ($WORKER_IP)..."
-  $SSH $WORKER_IP "curl -sfL https://get.k3s.io | K3S_URL=https://$MASTER_IP:6443 K3S_TOKEN=$K3S_TOKEN sh -" || true
-  sleep 15
-  remote_master "k3s kubectl wait --for=condition=Ready node --all --timeout=120s" || warn "Worker may take more time to join"
-  ok "Worker joined cluster"
-
-  # ── 3. Deploy MongoDB ──
-  if [[ "$MONGO_ENABLED" == "True" ]]; then
-    log "Deploying MongoDB..."
-    echo "$MONGO_MANIFEST" | remote_master "cat > /tmp/mongodb.yaml && k3s kubectl apply -f /tmp/mongodb.yaml"
-    remote_master "k3s kubectl wait --for=condition=Ready pod -l app=mongodb --timeout=120s" || warn "MongoDB pod taking time..."
-    ok "MongoDB deployed on NodePort $MONGO_NODEPORT"
-  fi
-
-  # ── 4. Deploy Ollama ──
-  log "Deploying Ollama ($OLLAMA_REPLICAS replicas)..."
-  echo "$OLLAMA_MANIFEST" | remote_master "cat > /tmp/ollama.yaml && k3s kubectl apply -f /tmp/ollama.yaml"
-  remote_master "k3s kubectl wait --for=condition=Ready pod -l app=ollama --timeout=180s" || warn "Ollama pods taking time..."
-  ok "Ollama deployed on NodePort $OLLAMA_NODEPORT"
-
-  # ── 5. Pull models ──
-  cmd_sync_models
-
-  # ── 6. Deploy backend ──
-  cmd_deploy_backend
-
-  # ── 7. Deploy frontend ──
-  cmd_deploy_frontend
-
-  # ── 8. Sync users ──
-  sleep 5
-  cmd_sync_users
-
-  ok "=== Setup complete! ==="
-  echo "  Web UI:   http://$MASTER_IP:30080  (frontend pod → nginx proxy)"
-  echo "  Backend:  http://$MASTER_IP:30500  (backend pod NodePort)"
-  echo "  Ollama:   http://$MASTER_IP:$OLLAMA_NODEPORT  (inference NodePort)"
-  echo "  MongoDB:  $MASTER_IP:$MONGO_NODEPORT  (internal only)"
-}
-
-cmd_uninstall() {
-  log "Uninstalling from all nodes..."
-  warn "This will remove K3s, all pods, and all data."
-  read -rp "Type 'yes' to confirm: " confirm
-  [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
-
-  log "Removing K3s from master..."
-  remote_master "k3s-uninstall.sh 2>/dev/null || true"
-
-  log "Removing K3s agent from worker..."
-  $SSH $WORKER_IP "k3s-agent-uninstall.sh 2>/dev/null || true"
-
-  log "Stopping backend..."
-  remote_master "pkill -f 'node server.js' 2>/dev/null || true"
-
-  log "Removing nginx config..."
-  remote_master "rm -rf /var/www/html/* && systemctl restart nginx 2>/dev/null || true"
-
-  ok "Uninstall complete"
-}
-
-cmd_status() {
-  log "Cluster Status"
-  echo ""
-  remote_master "k3s kubectl get nodes -o wide" 2>/dev/null || warn "K3s not running on master"
-  echo ""
-  remote_master "k3s kubectl get pods -A" 2>/dev/null || true
-  echo ""
-  log "Models on cluster"
-  curl -s "http://$MASTER_IP:$OLLAMA_NODEPORT/api/tags" 2>/dev/null | \
-    python3 -c "import json,sys; [print(f\"  {m['name']}\") for m in json.load(sys.stdin).get('models',[])]" \
-    || warn "Ollama not reachable"
-  echo ""
-  log "Service Health"
-  curl -s "http://$MASTER_IP:30080/health" 2>/dev/null | \
-    python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"  Backend: {d['status']}, MongoDB: {d['mongo']}, Ollama: {d['ollama']}\")" \
-    || warn "Backend pod not reachable at http://$MASTER_IP:30080/health"
-}
-
-cmd_sync_models() {
-  log "Syncing models per config..."
-
-  MODELS=$(python3 -c "
-import json
-d = json.load(open('$CONFIG'))
-for m in d['ollama']['models']:
-    print(m)
-")
-
-  # Get all Ollama pods
-  PODS=$(remote_master "k3s kubectl get pods -l app=ollama -o jsonpath='{.items[*].metadata.name}'" 2>/dev/null || echo "")
-
-  for MODEL in $MODELS; do
-    log "Ensuring $MODEL is pulled on all pods..."
-    for POD in $PODS; do
-      INSTALLED=$(remote_master "k3s kubectl exec $POD -- ollama list 2>/dev/null | grep -c '^$MODEL'" 2>/dev/null || echo "0")
-      if [[ "$INSTALLED" == "0" ]]; then
-        log "  Pulling $MODEL on $POD..."
-        remote_master "k3s kubectl exec $POD -- ollama pull $MODEL" 2>/dev/null &
-      else
-        ok "  $MODEL already on $POD"
-      fi
-    done
-  done
-  wait
-  ok "Model sync complete"
-}
-
 APP_MANIFEST=$(cat <<APPEOF
 apiVersion: apps/v1
 kind: Deployment
@@ -368,6 +808,7 @@ spec:
       labels:
         app: ollama-backend
     spec:
+      serviceAccountName: default
       containers:
       - name: backend
         image: docker.io/library/ollama-backend:latest
@@ -378,15 +819,25 @@ spec:
         - name: PORT
           value: "5000"
         - name: OLLAMA_URL
-          value: "http://ollama-service.default.svc.cluster.local:11434/api/chat"
+          value: "http://ollama-svc.default.svc.cluster.local:11434/api/chat"
         - name: OLLAMA_BASE
-          value: "http://ollama-service.default.svc.cluster.local:11434"
+          value: "http://ollama-svc.default.svc.cluster.local:11434"
         - name: MONGO_URI
           value: "mongodb://$MONGO_USER:$MONGO_PASS@mongodb.default.svc.cluster.local:27017/$MONGO_DB?authSource=admin"
         - name: JWT_SECRET
           value: "$BACKEND_JWT"
         - name: JWT_EXPIRY
           value: "$BACKEND_JWT_EXP"
+        - name: SMTP_HOST
+          value: "$SMTP_HOST"
+        - name: SMTP_PORT
+          value: "$SMTP_PORT"
+        - name: SMTP_USER
+          value: "$SMTP_USER"
+        - name: SMTP_PASS
+          value: "$SMTP_PASS"
+        - name: SMTP_FROM
+          value: "$SMTP_FROM"
         resources:
           limits:
             cpu: "1"
@@ -407,64 +858,171 @@ spec:
 APPEOF
 )
 
-_build_and_push_image() {
+RBAC_MANIFEST=$(cat <<RBACEOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ollama-backend-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes","pods","services"]
+  verbs: ["get","list"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes","pods"]
+  verbs: ["get","list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ollama-backend-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ollama-backend-role
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+RBACEOF
+)
+
+cluster_build_and_push_image() {
   local name="$1" dir="$2"
   log "Building $name image..."
   docker build -t "$name:latest" "$dir" --quiet
   docker save "$name:latest" -o "/tmp/${name}.tar"
+  # Push to master
   $SCP "/tmp/${name}.tar" "$SSH_USER@$MASTER_IP:/tmp/"
   remote_master "k3s ctr images import /tmp/${name}.tar"
-  ok "$name image imported into k3s"
+  # Push to worker so pods can schedule there too
+  $SCP "/tmp/${name}.tar" "$SSH_USER@$WORKER_IP:/tmp/"
+  remote_worker "k3s ctr images import /tmp/${name}.tar"
+  rm -f "/tmp/${name}.tar"
+  ok "$name image imported on both nodes"
 }
 
-cmd_deploy_backend() {
-  log "Building and deploying backend pod..."
-  (cd "$BACKEND_DIR" && npm install --production --silent)
-  _build_and_push_image "ollama-backend" "$BACKEND_DIR"
+cluster_setup() {
+  cluster_check_deps
+  log "Setting up Ollama Cluster on $MASTER_IP + $WORKER_IP"
 
+  log "Installing K3s on master ($MASTER_IP)..."
+  remote_master "curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -" || true
+  sleep 10
+  remote_master "k3s kubectl get nodes" || warn "K3s may already be running"
+  ok "K3s master ready"
+
+  log "Installing K3s agent on worker ($WORKER_IP)..."
+  $SSH $WORKER_IP "curl -sfL https://get.k3s.io | K3S_URL=https://$MASTER_IP:6443 K3S_TOKEN=$K3S_TOKEN sh -" || true
+  sleep 15
+  remote_master "k3s kubectl wait --for=condition=Ready node --all --timeout=120s" || warn "Worker may take more time to join"
+  ok "Worker joined cluster"
+
+  # RBAC for backend pod
+  echo "$RBAC_MANIFEST" | remote_master "cat > /tmp/rbac.yaml && k3s kubectl apply -f /tmp/rbac.yaml"
+  ok "RBAC configured"
+
+  if [[ "$MONGO_ENABLED" == "True" ]]; then
+    log "Deploying MongoDB..."
+    echo "$MONGO_MANIFEST" | remote_master "cat > /tmp/mongodb.yaml && k3s kubectl apply -f /tmp/mongodb.yaml"
+    remote_master "k3s kubectl wait --for=condition=Ready pod -l app=mongodb --timeout=120s" || warn "MongoDB pod taking time..."
+    ok "MongoDB deployed on NodePort $MONGO_NODEPORT"
+  fi
+
+  log "Deploying Ollama ($OLLAMA_REPLICAS replicas)..."
+  echo "$OLLAMA_MANIFEST" | remote_master "cat > /tmp/ollama.yaml && k3s kubectl apply -f /tmp/ollama.yaml"
+  remote_master "k3s kubectl wait --for=condition=Ready pod -l app=ollama --timeout=180s" || warn "Ollama pods taking time..."
+  ok "Ollama deployed on NodePort $OLLAMA_NODEPORT"
+
+  cluster_sync_models
+  cluster_deploy_backend
+  cluster_deploy_frontend
+  sleep 5
+  cluster_sync_users
+
+  hdr "Cluster setup complete"
+  ok "Web UI:   http://$MASTER_IP:30080"
+  ok "Backend:  http://$MASTER_IP:30500"
+  ok "Ollama:   http://$MASTER_IP:$OLLAMA_NODEPORT"
+  ok "MongoDB:  $MASTER_IP:$MONGO_NODEPORT  (internal)"
+}
+
+cluster_uninstall() {
+  warn "This will remove K3s, all pods, and all data."
+  read -rp "Type 'yes' to confirm: " confirm
+  [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
+
+  remote_master "k3s-uninstall.sh 2>/dev/null || true"
+  $SSH $WORKER_IP "k3s-agent-uninstall.sh 2>/dev/null || true"
+  remote_master "pkill -f 'node server.js' 2>/dev/null || true"
+  remote_master "rm -rf /var/www/html/* && systemctl restart nginx 2>/dev/null || true"
+  rm -f "$MODE_FILE"
+  ok "Cluster uninstall complete"
+}
+
+cluster_status() {
+  hdr "Cluster Status"
+  remote_master "k3s kubectl get nodes -o wide" 2>/dev/null || warn "K3s not running on master"
+  echo ""
+  remote_master "k3s kubectl get pods -A" 2>/dev/null || true
+  echo ""
+  hdr "Models on cluster"
+  curl -s "http://$MASTER_IP:$OLLAMA_NODEPORT/api/tags" 2>/dev/null | \
+    python3 -c "import json,sys; [print(f'  {m[\"name\"]}') for m in json.load(sys.stdin).get('models',[])]" \
+    || warn "Ollama not reachable"
+  echo ""
+  hdr "Backend Health"
+  curl -s "http://$MASTER_IP:30080/health" 2>/dev/null | \
+    python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  status: {d[\"status\"]}, mongo: {d[\"mongo\"]}, ollama: {d[\"ollama\"]}')" \
+    || warn "Backend not reachable at http://$MASTER_IP:30080/health"
+}
+
+cluster_sync_models() {
+  hdr "Syncing cluster models"
+  MODELS=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for m in d['ollama']['models']:
+    print(m)
+")
+  PODS=$(remote_master "k3s kubectl get pods -l app=ollama -o jsonpath='{.items[*].metadata.name}'" 2>/dev/null || echo "")
+  for MODEL in $MODELS; do
+    for POD in $PODS; do
+      INSTALLED=$(remote_master "k3s kubectl exec $POD -- ollama list 2>/dev/null | grep -c '^$MODEL'" 2>/dev/null || echo "0")
+      if [[ "$INSTALLED" == "0" ]]; then
+        log "  Pulling $MODEL on $POD..."
+        remote_master "k3s kubectl exec $POD -- ollama pull $MODEL" 2>/dev/null &
+      else
+        ok "  $MODEL already on $POD"
+      fi
+    done
+  done
+  wait
+  ok "Model sync complete"
+}
+
+cluster_deploy_backend() {
+  hdr "Deploying backend pod"
+  (cd "$BACKEND_DIR" && npm install --production --silent)
+  cluster_build_and_push_image "ollama-backend" "$BACKEND_DIR"
   echo "$APP_MANIFEST" | remote_master "cat > /tmp/app.yaml && k3s kubectl apply -f /tmp/app.yaml"
   remote_master "k3s kubectl rollout restart deployment/ollama-backend"
   remote_master "k3s kubectl wait --for=condition=Ready pod -l app=ollama-backend --timeout=60s"
   sleep 3
-  curl -sf "http://$MASTER_IP:30080/health" && ok "Backend running (via pod)" || warn "Health check failed"
+  curl -sf "http://$MASTER_IP:30500/health" && ok "Backend running" || warn "Health check failed — check pod logs"
 }
 
-cmd_deploy_frontend() {
-  log "Building and deploying frontend pod..."
+cluster_deploy_frontend() {
+  hdr "Deploying frontend pod"
   (cd "$FRONTEND_DIR" && npm install --silent && npm run build)
-  _build_and_push_image "ollama-frontend" "$FRONTEND_DIR"
-
+  cluster_build_and_push_image "ollama-frontend" "$FRONTEND_DIR"
   echo "$APP_MANIFEST" | remote_master "cat > /tmp/app.yaml && k3s kubectl apply -f /tmp/app.yaml"
   remote_master "k3s kubectl rollout restart deployment/ollama-frontend"
   remote_master "k3s kubectl wait --for=condition=Ready pod -l app=ollama-frontend --timeout=60s"
   ok "Frontend deployed at http://$MASTER_IP:30080"
 }
 
-cmd_sync_users() {
-  log "Syncing users from config.json..."
-  USERS=$(python3 -c "
-import json
-d = json.load(open('$CONFIG'))
-for u in d['users']:
-    print(u['username'], u['password'], u.get('role','user'), u.get('email',''))
-")
-
-  while IFS=' ' read -r username password role email; do
-    [[ -z "$username" ]] && continue
-    RESULT=$(curl -s -X POST "http://$MASTER_IP:30080/api/admin/users" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $(get_admin_token)" \
-      -d "{\"username\":\"$username\",\"password\":\"$password\",\"role\":\"$role\",\"email\":\"$email\"}" 2>/dev/null)
-
-    if echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if 'id' in d or 'already' in d.get('error','') else 1)" 2>/dev/null; then
-      ok "User '$username' ($role) ready"
-    else
-      warn "User '$username': $RESULT"
-    fi
-  done <<< "$USERS"
-}
-
-get_admin_token() {
+cluster_get_admin_token() {
+  local ADMIN_CREDS ADMIN_USER ADMIN_PASS
   ADMIN_CREDS=$(python3 -c "
 import json
 d = json.load(open('$CONFIG'))
@@ -473,40 +1031,62 @@ for u in d['users']:
         print(u['username'], u['password'])
         break
 ")
-  ADMIN_USER=$(echo $ADMIN_CREDS | awk '{print $1}')
-  ADMIN_PASS=$(echo $ADMIN_CREDS | awk '{print $2}')
-
-  # Bootstrap first admin if DB is empty
-  curl -s -X POST "http://$MASTER_IP:30080/api/auth/login" \
+  ADMIN_USER=$(echo "$ADMIN_CREDS" | awk '{print $1}')
+  ADMIN_PASS=$(echo "$ADMIN_CREDS" | awk '{print $2}')
+  TOKEN=$(curl -s -X POST "http://$MASTER_IP:30080/api/auth/login" \
     -H "Content-Type: application/json" \
     -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" 2>/dev/null | \
-    python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null || \
-    bootstrap_first_admin "$ADMIN_USER" "$ADMIN_PASS"
+    python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo "")
+  if [[ -z "$TOKEN" ]]; then
+    TOKEN=$(cluster_bootstrap_admin "$ADMIN_USER" "$ADMIN_PASS")
+  fi
+  echo "$TOKEN"
 }
 
-bootstrap_first_admin() {
+cluster_bootstrap_admin() {
   local user="$1" pass="$2"
-  # Directly insert into MongoDB if login fails (first-time setup)
-  remote_master "k3s kubectl exec deploy/mongodb -- mongosh '$MONGO_DB' \
-    -u '$MONGO_USER' -p '$MONGO_PASS' --authenticationDatabase admin \
-    --eval \"
-const bcrypt = require;
-db.users.updateOne(
-  {username: '$user'},
-  {\\\$setOnInsert: {username:'$user', passwordHash:'\$(python3 -c \"import bcrypt; print(bcrypt.hashpw(b'$pass', bcrypt.gensalt()).decode())\" 2>/dev/null || echo PLACEHOLDER)', role:'admin', createdAt: new Date()}},
-  {upsert: true}
-)\" 2>/dev/null || true"
-  # Retry login
+  local HASH
+  HASH=$(node -e "const b=require('bcryptjs');b.hash('$pass',12).then(h=>process.stdout.write(h))" \
+    2>/dev/null || echo "")
+  if [[ -n "$HASH" ]]; then
+    remote_master "k3s kubectl exec deploy/mongodb -- mongosh '$MONGO_DB' \
+      -u '$MONGO_USER' -p '$MONGO_PASS' --authenticationDatabase admin \
+      --eval \"db.users.updateOne({username:'$user'},{\\\$setOnInsert:{username:'$user',passwordHash:'$HASH',role:'admin',createdAt:new Date()}},{upsert:true})\"" 2>/dev/null || true
+  fi
   curl -s -X POST "http://$MASTER_IP:30080/api/auth/login" \
     -H "Content-Type: application/json" \
     -d "{\"username\":\"$user\",\"password\":\"$pass\"}" 2>/dev/null | \
     python3 -c "import json,sys; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo ""
 }
 
-cmd_add_user() {
+cluster_sync_users() {
+  log "Syncing users from config.json..."
+  local USERS TOKEN
+  USERS=$(python3 -c "
+import json
+d = json.load(open('$CONFIG'))
+for u in d['users']:
+    print(u['username'], u['password'], u.get('role','user'), u.get('email',''))
+")
+  TOKEN=$(cluster_get_admin_token)
+  while IFS=' ' read -r username password role email; do
+    [[ -z "$username" ]] && continue
+    RESULT=$(curl -s -X POST "http://$MASTER_IP:30080/api/admin/users" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $TOKEN" \
+      -d "{\"username\":\"$username\",\"password\":\"$password\",\"role\":\"$role\",\"email\":\"$email\"}" 2>/dev/null)
+    if echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if 'id' in d or 'already' in d.get('error','') else 1)" 2>/dev/null; then
+      ok "User '$username' ($role) ready"
+    else
+      warn "User '$username': $RESULT"
+    fi
+  done <<< "$USERS"
+}
+
+cluster_add_user() {
   local target_user="${1:-}"
   [[ -z "$target_user" ]] && { echo "Usage: ./run.sh add-user <username>"; exit 1; }
-
+  local USER_DATA
   USER_DATA=$(python3 -c "
 import json
 d = json.load(open('$CONFIG'))
@@ -516,9 +1096,9 @@ for u in d['users']:
         break
 ")
   [[ -z "$USER_DATA" ]] && err "User '$target_user' not found in config.json"
-
+  local username password role email
   read -r username password role email <<< "$USER_DATA"
-  TOKEN=$(get_admin_token)
+  local TOKEN; TOKEN=$(cluster_get_admin_token)
   RESULT=$(curl -s -X POST "http://$MASTER_IP:30080/api/admin/users" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
@@ -527,62 +1107,89 @@ for u in d['users']:
   ok "Done"
 }
 
-cmd_remove_user() {
+cluster_remove_user() {
   local target_user="${1:-}"
   [[ -z "$target_user" ]] && { echo "Usage: ./run.sh remove-user <username>"; exit 1; }
-
-  TOKEN=$(get_admin_token)
+  local TOKEN; TOKEN=$(cluster_get_admin_token)
   USER_ID=$(curl -s "http://$MASTER_IP:30080/api/admin/users" \
     -H "Authorization: Bearer $TOKEN" 2>/dev/null | \
     python3 -c "import json,sys; users=json.load(sys.stdin); print(next((u['_id'] for u in users if u['username']=='$target_user'),''))" 2>/dev/null)
-
   [[ -z "$USER_ID" ]] && err "User '$target_user' not found in the database"
-
   curl -s -X DELETE "http://$MASTER_IP:30080/api/admin/users/$USER_ID" \
     -H "Authorization: Bearer $TOKEN" >/dev/null
-  ok "User '$target_user' deleted (along with their conversations)"
+  ok "User '$target_user' removed"
 }
 
-cmd_logs() {
-  log "Backend pod logs..."
+cluster_logs() {
+  log "Backend pod logs (Ctrl+C to stop)..."
   remote_master "k3s kubectl logs -l app=ollama-backend -f --tail=100"
 }
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry point — route by mode
+# ─────────────────────────────────────────────────────────────────────────────
 
 COMMAND="${1:-help}"
 shift || true
 
+show_help() {
+  echo ""
+  echo "  Ollama Chat Manager"
+  echo ""
+  echo "  Usage: ./run.sh [--local|--cluster] <command> [args]"
+  echo ""
+  echo "  Mode flags (override saved .run-mode):"
+  echo "    --local     Force local mode"
+  echo "    --cluster   Force cluster mode"
+  echo "    (no flag)   Use saved mode or prompt on first run"
+  echo ""
+  echo "  Commands (work in both modes unless noted):"
+  echo "    setup              Full install and start everything"
+  echo "    uninstall          Remove deployment (asks confirmation)"
+  echo "    status             Show service/model/health status"
+  echo "    sync-models        Pull models from config.json"
+  echo "    sync-users         Create/update all users from config.json"
+  echo "    add-user <name>    Add a user from config.json"
+  echo "    remove-user <name> Delete a user"
+  echo "    deploy-backend     Reinstall deps and restart backend"
+  echo "    deploy-frontend    Rebuild React app and deploy"
+  echo "    logs [svc]         Tail logs (local: pass service name, default=ollama-backend)"
+  echo "    restart [target]   Restart services — local only (all/backend/nginx/ollama)"
+  echo ""
+  echo "  Current mode: $MODE  (saved in .run-mode)"
+  echo ""
+}
+
 case "$COMMAND" in
-  setup)          cmd_setup ;;
-  uninstall)      cmd_uninstall ;;
-  status)         cmd_status ;;
-  sync-models)    cmd_sync_models ;;
-  sync-users)     cmd_sync_users ;;
-  add-user)       cmd_add_user "${1:-}" ;;
-  remove-user)    cmd_remove_user "${1:-}" ;;
-  deploy-backend) cmd_deploy_backend ;;
-  deploy-frontend) cmd_deploy_frontend ;;
-  logs)           cmd_logs ;;
+  setup)
+    [[ "$MODE" == "local" ]]   && local_setup   || cluster_setup ;;
+  uninstall)
+    [[ "$MODE" == "local" ]]   && local_uninstall   || cluster_uninstall ;;
+  status)
+    [[ "$MODE" == "local" ]]   && local_status   || cluster_status ;;
+  sync-models)
+    [[ "$MODE" == "local" ]]   && local_sync_models   || cluster_sync_models ;;
+  sync-users)
+    [[ "$MODE" == "local" ]]   && local_sync_users   || cluster_sync_users ;;
+  add-user)
+    [[ "$MODE" == "local" ]]   && local_add_user "${1:-}"   || cluster_add_user "${1:-}" ;;
+  remove-user)
+    [[ "$MODE" == "local" ]]   && local_remove_user "${1:-}"   || cluster_remove_user "${1:-}" ;;
+  deploy-backend)
+    [[ "$MODE" == "local" ]]   && local_deploy_backend   || cluster_deploy_backend ;;
+  deploy-frontend)
+    [[ "$MODE" == "local" ]]   && local_deploy_frontend   || cluster_deploy_frontend ;;
+  logs)
+    [[ "$MODE" == "local" ]]   && local_logs "${1:-ollama-backend}"   || cluster_logs ;;
+  restart)
+    if [[ "$MODE" == "local" ]]; then
+      local_restart "${1:-all}"
+    else
+      warn "restart is for local mode. For cluster use: deploy-backend / deploy-frontend"
+    fi ;;
   help|--help|-h)
-    echo "Ollama Cluster Manager"
-    echo ""
-    echo "Usage: ./run.sh <command> [args]"
-    echo ""
-    echo "Commands:"
-    echo "  setup              Full cluster setup (K3s + MongoDB + Ollama + app)"
-    echo "  uninstall          Remove everything from all nodes"
-    echo "  status             Show cluster, model, and service status"
-    echo "  sync-models        Sync models from config.json to all Ollama pods"
-    echo "  sync-users         Create/update all users from config.json"
-    echo "  add-user <name>    Add a specific user from config.json"
-    echo "  remove-user <name> Delete a user from MongoDB"
-    echo "  deploy-backend     Reinstall deps and restart backend"
-    echo "  deploy-frontend    Rebuild React app and deploy to nginx"
-    echo "  logs               Tail backend logs"
-    ;;
+    show_help ;;
   *)
     echo "Unknown command: $COMMAND. Run './run.sh help' for usage."
-    exit 1
-    ;;
+    exit 1 ;;
 esac

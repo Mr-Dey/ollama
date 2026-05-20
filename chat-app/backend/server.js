@@ -9,6 +9,7 @@ const https = require('https');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT        = process.env.PORT       || 5000;
@@ -19,6 +20,11 @@ const MONGO_URI   = process.env.MONGO_URI  ||
   `@localhost:${process.env.MONGO_PORT||'30017'}/${process.env.MONGO_DB||'ollama_chat'}?authSource=admin`;
 const JWT_SECRET  = process.env.JWT_SECRET || 'change-this-in-production-use-a-long-random-string-32chars';
 const JWT_EXPIRY  = process.env.JWT_EXPIRY || '24h';
+const SMTP_HOST   = process.env.SMTP_HOST  || '';
+const SMTP_PORT   = parseInt(process.env.SMTP_PORT || '587');
+const SMTP_USER   = process.env.SMTP_USER  || '';
+const SMTP_PASS   = process.env.SMTP_PASS  || '';
+const SMTP_FROM   = process.env.SMTP_FROM  || 'noreply@ollama.local';
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
@@ -57,8 +63,18 @@ const conversationSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+const otpSchema = new mongoose.Schema({
+  userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  email:     { type: String, required: true },
+  code:      { type: String, required: true },
+  expiresAt: { type: Date,   required: true },
+  used:      { type: Boolean, default: false },
+});
+otpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // auto-delete expired
+
 const User         = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
+const OtpToken     = mongoose.model('OtpToken', otpSchema);
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 
@@ -160,6 +176,115 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   const user = await User.findById(req.user.id).select('-passwordHash');
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json(user);
+});
+
+// ─── Mailer ───────────────────────────────────────────────────────────────────
+
+function sendOtpEmail(to, code) {
+  if (!SMTP_HOST) {
+    // No SMTP configured — print to console for dev/testing
+    console.log(`\n[OTP] To: ${to}  Code: ${code}  (configure SMTP_HOST to send real emails)\n`);
+    return Promise.resolve();
+  }
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+  });
+  return transporter.sendMail({
+    from: `"Ollama Cluster" <${SMTP_FROM}>`,
+    to,
+    subject: 'Your password reset code',
+    text: `Your one-time password reset code is: ${code}\n\nIt expires in 10 minutes. If you did not request this, ignore this email.`,
+    html: `
+      <div style="font-family:monospace;max-width:480px;margin:40px auto;padding:32px;border:1px solid #25252a;border-radius:12px;background:#0c0c0d;color:#ededed">
+        <div style="font-size:28px;font-weight:700;color:#efe7d7;letter-spacing:-0.02em;margin-bottom:8px">Λ</div>
+        <h2 style="margin:0 0 20px;font-size:16px;font-weight:500;color:#ededed">Password reset code</h2>
+        <div style="font-size:36px;font-weight:700;letter-spacing:0.25em;color:#efe7d7;background:#18181b;border:1px solid #25252a;border-radius:8px;padding:18px 24px;text-align:center;margin-bottom:20px">${code}</div>
+        <p style="margin:0;font-size:12px;color:#7a7a82;line-height:1.6">This code expires in <strong style="color:#ededed">10 minutes</strong>. If you didn't request a password reset, you can safely ignore this email.</p>
+      </div>`,
+  });
+}
+
+// ─── Password Reset Routes ────────────────────────────────────────────────────
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    // Always respond ok — don't leak whether email exists
+    if (!user) return res.json({ ok: true });
+
+    const code = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);          // 10 min
+
+    // Invalidate any previous OTPs for this user
+    await OtpToken.deleteMany({ userId: user._id });
+    await OtpToken.create({ userId: user._id, email: user.email, code, expiresAt });
+
+    await sendOtpEmail(user.email, code);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Forgot-password error:', err.message);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
+
+    const record = await OtpToken.findOne({
+      email: email.toLowerCase().trim(),
+      code,
+      used: false,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!record) return res.status(400).json({ error: 'Invalid or expired code' });
+
+    // Issue a short-lived reset token (15 min) so the client can call reset-password
+    const resetToken = jwt.sign(
+      { userId: record.userId.toString(), otpId: record._id.toString(), purpose: 'reset' },
+      JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    res.json({ ok: true, resetToken });
+  } catch (err) {
+    console.error('Verify-OTP error:', err.message);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { resetToken, password } = req.body;
+    if (!resetToken || !password) return res.status(400).json({ error: 'Token and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    let payload;
+    try {
+      payload = jwt.verify(resetToken, JWT_SECRET);
+    } catch {
+      return res.status(400).json({ error: 'Reset token expired or invalid' });
+    }
+    if (payload.purpose !== 'reset') return res.status(400).json({ error: 'Invalid token' });
+
+    const record = await OtpToken.findById(payload.otpId);
+    if (!record || record.used) return res.status(400).json({ error: 'Reset token already used' });
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    await User.updateOne({ _id: payload.userId }, { passwordHash });
+    await OtpToken.updateOne({ _id: record._id }, { used: true });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Reset-password error:', err.message);
+    res.status(500).json({ error: 'Password reset failed' });
+  }
 });
 
 // ─── Conversation Routes ──────────────────────────────────────────────────────
