@@ -215,7 +215,7 @@ app.post('/api/conversations/:id/messages', requireAuth, upload.array('files'), 
     const conv = await Conversation.findOne({ _id: req.params.id, userId: req.user.id });
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
-    let { message, model, images = [] } = req.body;
+    let { message, model, images = [], system, temperature, top_p, max_tokens } = req.body;
     let contextText = '';
 
     if (req.files?.length > 0) {
@@ -233,16 +233,31 @@ app.post('/api/conversations/:id/messages', requireAuth, upload.array('files'), 
     const usedModel = model || conv.model;
     const t0 = Date.now();
 
+    // Build full conversation history so the model has context
+    const historyMessages = conv.messages.map(m => ({ role: m.role, content: m.content }));
+    historyMessages.push({ role: 'user', content: fullPrompt });
+
     const payload = {
       model:    usedModel,
-      messages: [{ role: 'user', content: fullPrompt }],
+      messages: historyMessages,
       stream:   false,
     };
 
+    // System prompt
+    if (system && system.trim()) payload.system = system.trim();
+
+    // Sampling options
+    const opts = {};
+    if (temperature !== undefined && !isNaN(parseFloat(temperature))) opts.temperature = parseFloat(temperature);
+    if (top_p       !== undefined && !isNaN(parseFloat(top_p)))       opts.top_p       = parseFloat(top_p);
+    if (max_tokens  !== undefined && !isNaN(parseInt(max_tokens)))     opts.num_predict = parseInt(max_tokens);
+    if (Object.keys(opts).length > 0) payload.options = opts;
+
+    // Images — use the model already resolved by the frontend
     const imagesArr = Array.isArray(images) ? images : (images ? [images] : []);
     if (imagesArr.length > 0) {
-      payload.messages[0].images = imagesArr.map(img => img.split(',')[1] || img);
-      payload.model = 'llava:7b';
+      const lastMsg = payload.messages[payload.messages.length - 1];
+      lastMsg.images = imagesArr.map(img => img.split(',')[1] || img);
     }
 
     const aiRes   = await axios.post(OLLAMA_URL, payload, { timeout: 120000 });

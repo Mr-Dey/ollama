@@ -66,7 +66,15 @@ interface PodRow {
   age: string;
 }
 
-type View = 'chat' | 'cluster' | 'models' | 'admin';
+type View = 'chat' | 'cluster' | 'models' | 'admin' | 'apidocs';
+
+// Models that natively support image input
+const VISION_MODELS = new Set(['gemma3:4b', 'gemma3:12b', 'llava:7b']);
+const VISION_FALLBACK = 'gemma3:12b';
+
+function resolveVisionModel(selectedModel: string): string {
+  return VISION_MODELS.has(selectedModel) ? selectedModel : VISION_FALLBACK;
+}
 
 // ─── API Helpers ──────────────────────────────────────────────────────────────
 
@@ -518,6 +526,12 @@ function Sidebar({
     });
   }
 
+  navViews.push({
+    v: 'apidocs',
+    label: 'API Docs',
+    icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>,
+  });
+
   return (
     <aside className="sidebar">
       <div className="side-section">
@@ -721,16 +735,18 @@ interface ComposerProps {
   onSend: () => void;
   loading: boolean;
   isListening: boolean;
+  micSupported: boolean;
   onToggleMic: () => void;
   attachments: Attachment[];
   onAttach: (files: FileList) => void;
   onRemoveAttach: (i: number) => void;
   model: string;
+  visionModel: string;
 }
 
 function Composer({
-  value, onChange, onSend, loading, isListening, onToggleMic,
-  attachments, onAttach, onRemoveAttach, model,
+  value, onChange, onSend, loading, isListening, micSupported, onToggleMic,
+  attachments, onAttach, onRemoveAttach, model, visionModel,
 }: ComposerProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
@@ -749,11 +765,10 @@ function Composer({
     <div className="composer-wrap">
       {hasImages && (
         <div className="modal-route-banner" style={{ marginBottom: 8 }}>
-          <span>will route to</span>
-          <span className="arrow">→</span>
-          <span className="tag">llava:7b</span>
-          <span style={{ color: 'var(--ink-4)' }}>·</span>
-          <span style={{ color: 'var(--ink-3)' }}>vision model</span>
+          {VISION_MODELS.has(model)
+            ? <><span>vision enabled</span><span className="arrow">→</span><span className="tag">{model}</span><span style={{ color: 'var(--ink-4)' }}>·</span><span style={{ color: 'var(--ink-3)' }}>native vision</span></>
+            : <><span>routing to</span><span className="arrow">→</span><span className="tag">{visionModel}</span><span style={{ color: 'var(--ink-4)' }}>·</span><span style={{ color: 'var(--ink-3)' }}>vision model</span></>
+          }
         </div>
       )}
 
@@ -805,11 +820,13 @@ function Composer({
           />
 
           <button
-            className={`tool-btn icon-only${isListening ? ' mic-rec' : ''}`}
+            className={`tool-btn icon-only${isListening ? ' mic-rec' : ''}${!micSupported ? ' mic-unavail' : ''}`}
             onClick={onToggleMic}
-            title={isListening ? 'Stop recording' : 'Voice input'}
+            title={!micSupported ? 'Voice input requires HTTPS' : isListening ? 'Stop recording' : 'Voice input'}
           >
-            {isListening
+            {!micSupported
+              ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: 0, color: 'var(--warn)', whiteSpace: 'nowrap' }}>HTTPS only</span>
+              : isListening
               ? <span className="waveform">
                   <span /><span /><span /><span /><span />
                 </span>
@@ -1277,6 +1294,308 @@ function AdminView({ token }: { token: string }) {
   );
 }
 
+// ─── ApiDocsView ──────────────────────────────────────────────────────────────
+
+interface Endpoint {
+  method: 'GET' | 'POST' | 'DELETE' | 'PATCH';
+  path: string;
+  auth: 'none' | 'bearer' | 'admin';
+  desc: string;
+  body?: string;
+  response: string;
+  note?: string;
+}
+
+const API_GROUPS: { label: string; endpoints: Endpoint[] }[] = [
+  {
+    label: 'Authentication',
+    endpoints: [
+      {
+        method: 'POST', path: '/api/auth/login', auth: 'none',
+        desc: 'Authenticate with username and password. Returns a JWT token valid for 24h.',
+        body: JSON.stringify({ username: 'admin', password: 'admin123' }, null, 2),
+        response: JSON.stringify({ token: 'eyJhbGci...', user: { id: '...', username: 'admin', role: 'admin', email: 'admin@ollama.local' } }, null, 2),
+      },
+      {
+        method: 'GET', path: '/api/auth/me', auth: 'bearer',
+        desc: 'Returns the profile of the currently authenticated user.',
+        response: JSON.stringify({ _id: '...', username: 'admin', role: 'admin', email: 'admin@ollama.local', createdAt: '2026-05-15T00:00:00Z', lastLogin: '2026-05-20T10:00:00Z' }, null, 2),
+      },
+    ],
+  },
+  {
+    label: 'Conversations',
+    endpoints: [
+      {
+        method: 'GET', path: '/api/conversations', auth: 'bearer',
+        desc: 'List all conversations for the authenticated user, sorted by most recently updated.',
+        response: JSON.stringify([{ _id: '...', title: 'My first chat', model: 'qwen3:8b', createdAt: '...', updatedAt: '...' }], null, 2),
+      },
+      {
+        method: 'POST', path: '/api/conversations', auth: 'bearer',
+        desc: 'Create a new empty conversation.',
+        body: JSON.stringify({ title: 'My chat', model: 'qwen3:8b' }, null, 2),
+        response: JSON.stringify({ _id: '664abc...', title: 'My chat', model: 'qwen3:8b', messages: [], createdAt: '...', updatedAt: '...' }, null, 2),
+      },
+      {
+        method: 'GET', path: '/api/conversations/:id', auth: 'bearer',
+        desc: 'Fetch a conversation including its full message history.',
+        response: JSON.stringify({ _id: '...', title: 'My chat', model: 'qwen3:8b', messages: [{ role: 'user', content: 'Hello', createdAt: '...' }, { role: 'assistant', content: 'Hi!', model: 'qwen3:8b', latency: '1230ms', createdAt: '...' }] }, null, 2),
+      },
+      {
+        method: 'DELETE', path: '/api/conversations/:id', auth: 'bearer',
+        desc: 'Delete a conversation and all its messages.',
+        response: JSON.stringify({ ok: true }, null, 2),
+      },
+    ],
+  },
+  {
+    label: 'Messages',
+    endpoints: [
+      {
+        method: 'POST', path: '/api/conversations/:id/messages', auth: 'bearer',
+        desc: 'Send a message to a conversation and get an AI reply. Supports file and image uploads via multipart/form-data. Images auto-route to a vision model.',
+        body: `// multipart/form-data fields:
+message    : "Summarize this document"   // required
+model      : "qwen3:8b"                  // optional, overrides conversation model
+temperature: "0.7"                       // optional
+top_p      : "0.9"                       // optional
+max_tokens : "2048"                      // optional
+system     : "You are a helpful..."      // optional
+files      : <File>                      // optional, attach PDF/TXT/MD/JS/TS etc.
+images     : "data:image/png;base64,..." // optional, base64 image for vision`,
+        response: JSON.stringify({ reply: 'The document discusses...', model: 'qwen3:8b', latency: '2340ms', conversationId: '664abc...' }, null, 2),
+        note: 'If images are attached, the model is automatically switched to a vision-capable model (gemma3:12b if current model has no vision support).',
+      },
+    ],
+  },
+  {
+    label: 'Models',
+    endpoints: [
+      {
+        method: 'GET', path: '/api/models', auth: 'bearer',
+        desc: 'List all models currently available on the Ollama cluster.',
+        response: JSON.stringify([{ name: 'qwen3:8b', size: 5200000000 }, { name: 'gemma3:12b', size: 8100000000 }, { name: 'deepseek-r1:8b', size: 5200000000 }], null, 2),
+      },
+    ],
+  },
+  {
+    label: 'Cluster',
+    endpoints: [
+      {
+        method: 'GET', path: '/api/cluster/status', auth: 'bearer',
+        desc: 'Returns live cluster metrics: node CPU/memory usage, pod list, and available models. Reads from the Kubernetes in-cluster API.',
+        response: JSON.stringify({
+          nodes: [{ name: 'k3s-node-1', role: 'master', ip: '172.16.9.203', cpu: 10, mem: 7, pods: 11 }],
+          pods: [{ name: 'ollama-xxx', namespace: 'default', status: 'Running', ready: '1/1', restarts: 0, age: '2026-05-15T03:53:34Z' }],
+          models: [{ name: 'qwen3:8b', size: 5200000000 }],
+        }, null, 2),
+      },
+    ],
+  },
+  {
+    label: 'Admin — User Management',
+    endpoints: [
+      {
+        method: 'GET', path: '/api/admin/users', auth: 'admin',
+        desc: 'List all users. Requires admin role.',
+        response: JSON.stringify([{ _id: '...', username: 'admin', role: 'admin', email: 'admin@ollama.local', createdAt: '...', lastLogin: '...' }], null, 2),
+      },
+      {
+        method: 'POST', path: '/api/admin/users', auth: 'admin',
+        desc: 'Create a new user. Requires admin role.',
+        body: JSON.stringify({ username: 'newuser', password: 'pass123', role: 'user', email: 'user@example.com' }, null, 2),
+        response: JSON.stringify({ id: '...', username: 'newuser', role: 'user', email: 'user@example.com' }, null, 2),
+      },
+      {
+        method: 'DELETE', path: '/api/admin/users/:id', auth: 'admin',
+        desc: 'Delete a user and all their conversations. Cannot delete your own account.',
+        response: JSON.stringify({ ok: true }, null, 2),
+      },
+      {
+        method: 'PATCH', path: '/api/admin/users/:id/password', auth: 'admin',
+        desc: 'Change a user\'s password. Requires admin role.',
+        body: JSON.stringify({ password: 'newpassword123' }, null, 2),
+        response: JSON.stringify({ ok: true }, null, 2),
+      },
+    ],
+  },
+  {
+    label: 'Health',
+    endpoints: [
+      {
+        method: 'GET', path: '/health', auth: 'none',
+        desc: 'Health check endpoint. Returns MongoDB and Ollama connectivity status. No authentication required.',
+        response: JSON.stringify({ status: 'ok', mongo: true, ollama: true }, null, 2),
+      },
+    ],
+  },
+];
+
+const METHOD_COLOR: Record<string, string> = {
+  GET: '#6db3f2',
+  POST: '#7dd87a',
+  DELETE: '#f08570',
+  PATCH: '#f0c674',
+};
+const AUTH_LABEL: Record<string, { text: string; color: string }> = {
+  none:   { text: 'No auth',    color: 'var(--ink-4)' },
+  bearer: { text: 'Bearer JWT', color: 'var(--bone)' },
+  admin:  { text: 'Admin JWT',  color: '#f0c674' },
+};
+
+function ApiDocsView({ baseUrl }: { baseUrl: string }) {
+  const [openIdx, setOpenIdx] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+
+  const copy = (text: string, key: string) => {
+    navigator.clipboard.writeText(text).catch(() => {});
+    setCopied(key);
+    setTimeout(() => setCopied(null), 1800);
+  };
+
+  const makeCurl = (ep: Endpoint): string => {
+    const authHeader = ep.auth !== 'none'
+      ? `\\\n  -H "Authorization: Bearer $TOKEN" `
+      : '';
+    const contentType = ep.body && !ep.body.startsWith('//')
+      ? `\\\n  -H "Content-Type: application/json" `
+      : '';
+    const bodyFlag = ep.body && !ep.body.startsWith('//')
+      ? `\\\n  -d '${ep.body.replace(/\n\s*/g, ' ')}' `
+      : '';
+    return `curl -X ${ep.method} "${baseUrl}${ep.path}" ${authHeader}${contentType}${bodyFlag}`.trim();
+  };
+
+  const filtered = search.trim()
+    ? API_GROUPS.map(g => ({
+        ...g,
+        endpoints: g.endpoints.filter(e =>
+          e.path.toLowerCase().includes(search.toLowerCase()) ||
+          e.desc.toLowerCase().includes(search.toLowerCase()) ||
+          e.method.toLowerCase().includes(search.toLowerCase())
+        ),
+      })).filter(g => g.endpoints.length > 0)
+    : API_GROUPS;
+
+  return (
+    <div className="cluster-view">
+      <div className="cluster-head">
+        <div>
+          <div className="crumb">k3s-cluster / api-reference</div>
+          <h2>API Reference</h2>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)' }}>
+            Base URL
+          </div>
+          <div
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--bone)', background: 'var(--bg-elev)', border: '1px solid var(--line)', borderRadius: 6, padding: '6px 12px', cursor: 'pointer' }}
+            onClick={() => copy(baseUrl, 'baseurl')}
+            title="Click to copy"
+          >
+            {baseUrl}
+            {copied === 'baseurl' && <span style={{ marginLeft: 8, color: 'var(--signal)', fontSize: 10 }}>copied!</span>}
+          </div>
+        </div>
+      </div>
+
+      {/* Auth note */}
+      <div style={{ maxWidth: 1180, margin: '0 auto 20px', padding: '14px 18px', border: '1px solid var(--line)', borderRadius: 10, background: 'var(--bg-elev)', fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-3)', lineHeight: 1.7 }}>
+        <span style={{ color: 'var(--bone)', fontWeight: 600 }}>Authentication: </span>
+        Get a token via <span style={{ color: 'var(--ink-2)' }}>POST /api/auth/login</span>, then send it as{' '}
+        <span style={{ color: 'var(--ink-2)' }}>Authorization: Bearer &lt;token&gt;</span> on protected routes.
+        <span style={{ marginLeft: 16, color: '#f0c674' }}>Admin</span> routes additionally require <span style={{ color: 'var(--ink-2)' }}>role: "admin"</span> on the JWT.
+      </div>
+
+      {/* Search */}
+      <div style={{ maxWidth: 1180, margin: '0 auto 20px' }}>
+        <input
+          type="text"
+          placeholder="Filter endpoints…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          style={{ width: '100%', background: 'var(--bg-elev)', border: '1px solid var(--line)', borderRadius: 8, padding: '9px 14px', color: 'var(--ink)', fontFamily: 'var(--font-mono)', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+        />
+      </div>
+
+      {filtered.map(group => (
+        <div key={group.label} style={{ maxWidth: 1180, margin: '0 auto 28px' }}>
+          <div className="section-head" style={{ marginBottom: 10 }}>{group.label}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {group.endpoints.map(ep => {
+              const key = `${ep.method}${ep.path}`;
+              const isOpen = openIdx === key;
+              const curlCmd = makeCurl(ep);
+              return (
+                <div key={key} style={{ border: '1px solid var(--line)', borderRadius: 10, background: 'var(--bg-elev)', overflow: 'hidden' }}>
+                  {/* Header row */}
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '13px 18px', cursor: 'pointer', userSelect: 'none' }}
+                    onClick={() => setOpenIdx(isOpen ? null : key)}
+                  >
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: METHOD_COLOR[ep.method], minWidth: 52, letterSpacing: '0.04em' }}>{ep.method}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--ink)', flex: 1 }}>{ep.path}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: AUTH_LABEL[ep.auth].color, border: `1px solid ${AUTH_LABEL[ep.auth].color}33`, borderRadius: 4, padding: '2px 7px', opacity: 0.85 }}>{AUTH_LABEL[ep.auth].text}</span>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)', maxWidth: 480, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ep.desc}</span>
+                    <span style={{ color: 'var(--ink-3)', fontSize: 12, marginLeft: 8 }}>{isOpen ? '▲' : '▼'}</span>
+                  </div>
+
+                  {/* Expanded detail */}
+                  {isOpen && (
+                    <div style={{ borderTop: '1px solid var(--line)', padding: '18px 18px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+                      {/* Description */}
+                      <p style={{ margin: 0, fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.6 }}>{ep.desc}</p>
+                      {ep.note && <p style={{ margin: 0, fontSize: 12, color: 'var(--warn)', fontFamily: 'var(--font-mono)', background: 'var(--warn-soft)', border: '1px solid rgba(240,198,116,0.25)', borderRadius: 6, padding: '8px 12px', lineHeight: 1.6 }}>ℹ {ep.note}</p>}
+
+                      <div style={{ display: 'grid', gridTemplateColumns: ep.body ? '1fr 1fr' : '1fr', gap: 14 }}>
+                        {/* Request body */}
+                        {ep.body && (
+                          <div>
+                            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ink-3)', marginBottom: 8 }}>Request Body</div>
+                            <div style={{ position: 'relative' }}>
+                              <pre style={{ margin: 0, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, padding: '12px 14px', fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-2)', overflow: 'auto', maxHeight: 240, lineHeight: 1.55 }}>{ep.body}</pre>
+                              <button onClick={() => copy(ep.body!, key + 'body')} style={{ position: 'absolute', top: 8, right: 8, background: 'var(--bg-elev)', border: '1px solid var(--line)', borderRadius: 4, padding: '3px 8px', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', cursor: 'pointer' }}>
+                                {copied === key + 'body' ? 'copied!' : 'copy'}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {/* Response */}
+                        <div>
+                          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ink-3)', marginBottom: 8 }}>Response</div>
+                          <div style={{ position: 'relative' }}>
+                            <pre style={{ margin: 0, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, padding: '12px 14px', fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--signal)', overflow: 'auto', maxHeight: 240, lineHeight: 1.55 }}>{ep.response}</pre>
+                            <button onClick={() => copy(ep.response, key + 'res')} style={{ position: 'absolute', top: 8, right: 8, background: 'var(--bg-elev)', border: '1px solid var(--line)', borderRadius: 4, padding: '3px 8px', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', cursor: 'pointer' }}>
+                              {copied === key + 'res' ? 'copied!' : 'copy'}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* cURL */}
+                      <div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--ink-3)', marginBottom: 8 }}>cURL Example</div>
+                        <div style={{ position: 'relative' }}>
+                          <pre style={{ margin: 0, background: 'var(--bg)', border: '1px solid var(--line)', borderRadius: 8, padding: '12px 14px 12px 14px', fontFamily: 'var(--font-mono)', fontSize: 12, color: '#6db3f2', overflow: 'auto', lineHeight: 1.7, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{curlCmd}</pre>
+                          <button onClick={() => copy(curlCmd, key + 'curl')} style={{ position: 'absolute', top: 8, right: 8, background: 'var(--bg-elev)', border: '1px solid var(--line)', borderRadius: 4, padding: '3px 8px', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', cursor: 'pointer' }}>
+                            {copied === key + 'curl' ? 'copied!' : 'copy'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── SettingsDrawer ───────────────────────────────────────────────────────────
 
 interface SettingsDrawerProps {
@@ -1308,24 +1627,36 @@ function SettingsDrawer({
             value={settings.model}
             onChange={e => onChange({ ...settings, model: e.target.value })}
           >
-            <optgroup label="Llama">
-              <option value="llama3:8b">llama3:8b</option>
-              <option value="llama3:70b">llama3:70b</option>
+            <optgroup label="Qwen3 (latest)">
+              <option value="qwen3:0.6b">qwen3:0.6b — 522 MB</option>
+              <option value="qwen3:1.7b">qwen3:1.7b — 1.4 GB</option>
+              <option value="qwen3:4b">qwen3:4b — 2.5 GB</option>
+              <option value="qwen3:8b">qwen3:8b — 5.2 GB</option>
             </optgroup>
-            <optgroup label="Gemma">
-              <option value="gemma:7b">gemma:7b</option>
-              <option value="gemma2:2b">gemma2:2b</option>
-              <option value="gemma3:4b">gemma3:4b</option>
+            <optgroup label="Qwen2.5">
+              <option value="qwen2.5:3b">qwen2.5:3b — 1.9 GB</option>
+              <option value="qwen2.5:7b">qwen2.5:7b — 4.7 GB</option>
             </optgroup>
-            <optgroup label="Qwen">
-              <option value="qwen2.5:3b">qwen2.5:3b</option>
+            <optgroup label="Gemma3 (latest)">
+              <option value="gemma3:4b">gemma3:4b — 3.3 GB · vision</option>
+              <option value="gemma3:12b">gemma3:12b — 8.1 GB · vision</option>
             </optgroup>
-            <optgroup label="Other">
-              <option value="mistral:7b">mistral:7b</option>
-              <option value="phi3:mini">phi3:mini</option>
+            <optgroup label="Gemma3n">
+              <option value="gemma3n:e2b">gemma3n:e2b — 5.6 GB</option>
+              <option value="gemma3n:e4b">gemma3n:e4b — 7.5 GB</option>
+            </optgroup>
+            <optgroup label="DeepSeek-R1 (reasoning)">
+              <option value="deepseek-r1:1.5b">deepseek-r1:1.5b — 1.1 GB</option>
+              <option value="deepseek-r1:7b">deepseek-r1:7b — 4.7 GB</option>
+              <option value="deepseek-r1:8b">deepseek-r1:8b — 5.2 GB</option>
+            </optgroup>
+            <optgroup label="Legacy">
+              <option value="llama3:8b">llama3:8b — 4.7 GB</option>
+              <option value="gemma:7b">gemma:7b — 5.0 GB</option>
+              <option value="gemma2:2b">gemma2:2b — 1.6 GB</option>
             </optgroup>
             <optgroup label="Vision">
-              <option value="llava:7b">llava:7b</option>
+              <option value="llava:7b">llava:7b — 4.7 GB · vision</option>
             </optgroup>
           </select>
         </div>
@@ -1498,8 +1829,6 @@ function MobileOverlay({ onClose, messages, streaming, model, online }: MobileOv
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const hostname = window.location.hostname;
-
   // ── Auth state ──
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('ollama_token'));
   const [currentUser, setCurrentUser] = useState<{ username: string; role: string; email?: string } | null>(null);
@@ -1519,7 +1848,7 @@ export default function App() {
 
   // ── Settings ──
   const [settings, setSettings] = useState<Settings>({
-    model: 'llama3:8b',
+    model: 'qwen3:8b',
     temp: 0.7,
     topP: 0.9,
     maxTokens: 2048,
@@ -1543,6 +1872,7 @@ export default function App() {
 
   // ── STT ──
   const [isListening, setIsListening] = useState(false);
+  const [micSupported, setMicSupported] = useState(true);
   const recognitionRef = useRef<any>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1701,7 +2031,7 @@ export default function App() {
       setActiveId(id);
       setView('chat');
     }
-  }, [token, hostname, settings.model]);
+  }, [token, settings.model]);
 
   // ── Select thread (lazy-load messages) ──
   const handleSelectThread = useCallback(async (id: string) => {
@@ -1721,7 +2051,7 @@ export default function App() {
         // ignore
       }
     }
-  }, [threads, token, hostname]);
+  }, [threads, token]);
 
   // ── Delete thread ──
   const handleDeleteThread = useCallback(async (id: string) => {
@@ -1741,7 +2071,7 @@ export default function App() {
         return next;
       });
     }
-  }, [token, hostname, activeId]);
+  }, [token, activeId]);
 
   const addMessage = useCallback((threadId: string, msg: ChatMessage) => {
     setThreads(prev => prev.map(t =>
@@ -1810,7 +2140,7 @@ export default function App() {
     setLoading(true);
 
     const hasImage = attachments.some(a => a.kind === 'image');
-    const routedModel = hasImage ? 'llava:7b' : settings.model;
+    const routedModel = hasImage ? resolveVisionModel(settings.model) : settings.model;
 
     let replyText = '';
     let latency = '';
@@ -1881,7 +2211,7 @@ export default function App() {
     }
 
     setLoading(false);
-  }, [input, attachments, activeId, token, settings, hostname, addMessage, simulateStream]);
+  }, [input, attachments, activeId, token, settings, addMessage, simulateStream]);
 
   // ── Attach files ──
   const handleAttach = useCallback((files: FileList) => {
@@ -1910,7 +2240,11 @@ export default function App() {
   // ── STT ──
   const toggleMic = useCallback(() => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) return;
+    if (!SR) {
+      setMicSupported(false);
+      setTimeout(() => setMicSupported(true), 3000);
+      return;
+    }
     if (isListening) {
       recognitionRef.current?.stop();
       setIsListening(false);
@@ -1990,20 +2324,18 @@ export default function App() {
         currentUser={currentUser}
       />
 
-      {!sidebarCollapsed && (
-        <Sidebar
-          collapsed={sidebarCollapsed}
-          threads={threads}
-          activeId={activeId}
-          onSelect={handleSelectThread}
-          onNewChat={handleNewChat}
-          onDeleteThread={handleDeleteThread}
-          view={view}
-          onViewChange={setView}
-          currentUser={currentUser}
-          onLogout={handleLogout}
-        />
-      )}
+      <Sidebar
+        collapsed={sidebarCollapsed}
+        threads={threads}
+        activeId={activeId}
+        onSelect={handleSelectThread}
+        onNewChat={handleNewChat}
+        onDeleteThread={handleDeleteThread}
+        view={view}
+        onViewChange={setView}
+        currentUser={currentUser}
+        onLogout={handleLogout}
+      />
 
       <main className="main">
         {view === 'cluster' && (
@@ -2014,6 +2346,9 @@ export default function App() {
         )}
         {view === 'admin' && currentUser?.role === 'admin' && (
           <AdminView token={token} />
+        )}
+        {view === 'apidocs' && (
+          <ApiDocsView baseUrl={`http://${window.location.host}`} />
         )}
 
         {view === 'chat' && (
@@ -2045,7 +2380,7 @@ export default function App() {
                     <div className="msg-avatar">Λ</div>
                     <div className="msg-body">
                       <div className="msg-head">
-                        <span className="model">{hasImages ? 'llava:7b' : settings.model}</span>
+                        <span className="model">{hasImages ? resolveVisionModel(settings.model) : settings.model}</span>
                         <span className="latency">generating…</span>
                       </div>
                       {streamText
@@ -2076,32 +2411,36 @@ export default function App() {
               onSend={handleSend}
               loading={loading}
               isListening={isListening}
+              micSupported={micSupported}
               onToggleMic={toggleMic}
               attachments={attachments}
               onAttach={handleAttach}
               onRemoveAttach={i => setAttachments(prev => prev.filter((_, idx) => idx !== i))}
               model={settings.model}
+              visionModel={resolveVisionModel(settings.model)}
             />
           </>
         )}
 
-        <SettingsDrawer
-          open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          settings={settings}
-          onChange={setSettings}
-          density={density}
-          onDensityChange={d => {
-            setDensity(d);
-            document.documentElement.dataset.density = d;
-          }}
-          theme={theme}
-          onThemeChange={t => {
-            setTheme(t);
-            document.documentElement.dataset.theme = t;
-          }}
-        />
       </main>
+
+      {settingsOpen && <div className="settings-overlay" onClick={() => setSettingsOpen(false)} />}
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        settings={settings}
+        onChange={setSettings}
+        density={density}
+        onDensityChange={d => {
+          setDensity(d);
+          document.documentElement.dataset.density = d;
+        }}
+        theme={theme}
+        onThemeChange={t => {
+          setTheme(t);
+          document.documentElement.dataset.theme = t;
+        }}
+      />
 
       {mobileOverlay && (
         <MobileOverlay
