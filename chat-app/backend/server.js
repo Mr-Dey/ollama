@@ -12,6 +12,13 @@ const bcrypt      = require('bcryptjs');
 const nodemailer  = require('nodemailer');
 const rateLimit   = require('express-rate-limit');
 const swaggerJsdoc = require('swagger-jsdoc');
+const http        = require('http');
+
+// Disable HTTP keep-alive for Ollama calls so each request opens a fresh TCP
+// connection. K8s Services load-balance per connection — with keep-alive ON,
+// all requests would pin to a single Ollama pod and the other replicas sit idle.
+const ollamaHttpAgent = new http.Agent({ keepAlive: false });
+const ollamaAxios = axios.create({ httpAgent: ollamaHttpAgent });
 
 const app = express();
 const PORT        = process.env.PORT       || 5000;
@@ -740,7 +747,7 @@ app.post('/api/conversations/:id/messages', requireAuth, upload.array('files'), 
       };
 
       try {
-        const ollamaRes = await axios.post(OLLAMA_URL, payload, {
+        const ollamaRes = await ollamaAxios.post(OLLAMA_URL, payload, {
           responseType: 'stream',
           timeout: 0,
         });
@@ -776,7 +783,7 @@ app.post('/api/conversations/:id/messages', requireAuth, upload.array('files'), 
     }
 
     // ── Non-streaming path (legacy) ──
-    const aiRes   = await axios.post(OLLAMA_URL, payload, { timeout: 120000 });
+    const aiRes   = await ollamaAxios.post(OLLAMA_URL, payload, { timeout: 120000 });
     const latency = `${Date.now() - t0}ms`;
     const reply   = aiRes.data.message?.content || 'No response';
 
@@ -903,7 +910,7 @@ app.patch('/api/admin/users/:id/password', requireAuth, requireAdmin, async (req
 app.get('/api/cluster/status', requireAuth, async (req, res) => {
   try {
     const k8s = k8sClient();
-    const modelsRes = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 })
+    const modelsRes = await ollamaAxios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 })
       .then(r => r.data.models || []).catch(() => []);
 
     if (!k8s) {
@@ -983,7 +990,7 @@ app.get('/api/cluster/status', requireAuth, async (req, res) => {
  */
 app.get('/api/models', requireAuth, async (req, res) => {
   try {
-    const r = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 });
+    const r = await ollamaAxios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 });
     res.json(r.data.models || []);
   } catch {
     res.json([]);
@@ -1017,7 +1024,7 @@ app.get('/api/models/pull', requireAuth, requireAdmin, async (req, res) => {
   const send = (obj) => { if (!ended) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
 
   try {
-    const pullRes = await axios.post(`${OLLAMA_BASE}/api/pull`, { name: model, stream: true }, {
+    const pullRes = await ollamaAxios.post(`${OLLAMA_BASE}/api/pull`, { name: model, stream: true }, {
       responseType: 'stream',
       timeout: 0,
     });
@@ -1055,7 +1062,7 @@ app.get('/api/models/pull', requireAuth, requireAdmin, async (req, res) => {
  */
 app.delete('/api/models/:name', requireAuth, requireAdmin, async (req, res) => {
   try {
-    await axios.delete(`${OLLAMA_BASE}/api/delete`, { data: { name: req.params.name } });
+    await ollamaAxios.delete(`${OLLAMA_BASE}/api/delete`, { data: { name: req.params.name } });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.response?.data?.error || err.message });
@@ -1077,7 +1084,7 @@ app.get('/health', async (req, res) => {
   const mongoOk = mongoose.connection.readyState === 1;
   let ollamaOk = false;
   try {
-    await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 3000 });
+    await ollamaAxios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 3000 });
     ollamaOk = true;
   } catch {}
   res.json({ status: 'ok', mongo: mongoOk, ollama: ollamaOk, smtp: mailerStatus });
