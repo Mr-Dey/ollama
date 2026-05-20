@@ -14,14 +14,29 @@ FRONTEND_DIR="$SCRIPT_DIR/chat-app/frontend"
 
 [[ ! -f "$CONFIG" ]] && { echo "ERROR: config.json not found at $CONFIG"; exit 1; }
 
+# ─── Load .env (overrides config.json secrets) ────────────────────────────────
+
+ENV_FILE="$SCRIPT_DIR/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 # ─── Config helpers ───────────────────────────────────────────────────────────
 
 _cfg() { python3 -c "import json,sys; d=json.load(open('$CONFIG')); print(d$1)" 2>/dev/null || echo ""; }
 
+# Override config value with env var if set: _env <env_name> <fallback>
+_env() { local v="${!1:-}"; if [[ -n "$v" ]]; then echo "$v"; else echo "$2"; fi; }
+
 MASTER_IP=$(_cfg "['cluster']['master']['ip']")
+MASTER_HOSTNAME=$(_cfg "['cluster']['master']['hostname']")
 WORKER_IP=$(_cfg "['cluster']['worker']['ip']")
+WORKER_HOSTNAME=$(_cfg "['cluster']['worker']['hostname']")
 SSH_USER=$(_cfg "['cluster']['ssh']['user']")
-SSH_PASS=$(_cfg "['cluster']['ssh']['password']")
+SSH_PASS=$(_env SSH_PASSWORD "$(_cfg "['cluster']['ssh']['password']")")
 K3S_TOKEN=$(_cfg "['cluster']['k3s']['token']")
 
 OLLAMA_REPLICAS=$(_cfg "['ollama']['replicas']")
@@ -32,23 +47,25 @@ OLLAMA_MEM=$(_cfg "['ollama']['memory_limit']")
 MONGO_ENABLED=$(_cfg "['mongodb']['enabled']")
 MONGO_NODEPORT=$(_cfg "['mongodb']['nodeport']")
 MONGO_DB=$(_cfg "['mongodb']['database']")
-MONGO_USER=$(_cfg "['mongodb']['username']")
-MONGO_PASS=$(_cfg "['mongodb']['password']")
+MONGO_USER=$(_env MONGO_USER "$(_cfg "['mongodb']['username']")")
+MONGO_PASS=$(_env MONGO_PASS "$(_cfg "['mongodb']['password']")")
 
 BACKEND_PORT=$(_cfg "['backend']['port']")
-BACKEND_JWT=$(_cfg "['backend']['jwt_secret']")
+BACKEND_JWT=$(_env JWT_SECRET "$(_cfg "['backend']['jwt_secret']")")
 BACKEND_JWT_EXP=$(_cfg "['backend']['jwt_expiry']")
-SMTP_HOST=$(_cfg "['backend']['smtp']['host']")
-SMTP_PORT=$(_cfg "['backend']['smtp']['port']")
-SMTP_USER=$(_cfg "['backend']['smtp']['user']")
-SMTP_PASS=$(_cfg "['backend']['smtp']['pass']")
-SMTP_FROM=$(_cfg "['backend']['smtp']['from']")
+SMTP_HOST=$(_env SMTP_HOST "$(_cfg "['backend']['smtp']['host']")")
+SMTP_PORT=$(_env SMTP_PORT "$(_cfg "['backend']['smtp']['port']")")
+SMTP_USER=$(_env SMTP_USER "$(_cfg "['backend']['smtp']['user']")")
+SMTP_PASS=$(_env SMTP_PASS "$(_cfg "['backend']['smtp']['pass']")")
+SMTP_FROM=$(_env SMTP_FROM "$(_cfg "['backend']['smtp']['from']")")
 
 LOCAL_WEB_PORT=$(_cfg "['local']['web_port']")
+LOCAL_HTTPS_PORT=$(_cfg "['local'].get('https_port', 8443)")
 LOCAL_OLLAMA_PORT=$(_cfg "['local']['ollama_port']")
 LOCAL_BACKEND_PORT=$(_cfg "['local']['backend_port']")
+LOCAL_ENABLE_HTTPS=$(_cfg "['local'].get('enable_https', True)")
 
-SSH="sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no $SSH_USER"
+SSH="sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no"
 SCP="sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no"
 
 # ─── Display helpers ──────────────────────────────────────────────────────────
@@ -58,6 +75,27 @@ ok()   { echo -e "\033[1;32m✓ $*\033[0m"; }
 warn() { echo -e "\033[1;33m⚠ $*\033[0m"; }
 err()  { echo -e "\033[1;31m✗ $*\033[0m"; exit 1; }
 hdr()  { echo -e "\n\033[1;35m━━━ $* ━━━\033[0m"; }
+
+# ─── Generate/strengthen secrets on first setup ───────────────────────────────
+
+ensure_strong_jwt() {
+  if [[ "$BACKEND_JWT" == "change-this-in-production-use-a-long-random-string-32chars" ]]; then
+    warn "JWT_SECRET is still the default. Generating a strong one and saving to .env"
+    local NEW_SECRET
+    NEW_SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | base64)
+    if [[ ! -f "$ENV_FILE" ]]; then
+      cp "$SCRIPT_DIR/.env.example" "$ENV_FILE" 2>/dev/null || touch "$ENV_FILE"
+    fi
+    if grep -q "^JWT_SECRET=" "$ENV_FILE"; then
+      sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$NEW_SECRET|" "$ENV_FILE"
+    else
+      echo "JWT_SECRET=$NEW_SECRET" >> "$ENV_FILE"
+    fi
+    chmod 600 "$ENV_FILE"
+    BACKEND_JWT="$NEW_SECRET"
+    ok "JWT_SECRET written to .env (gitignored)"
+  fi
+}
 
 # ─── Mode selection ───────────────────────────────────────────────────────────
 
@@ -235,25 +273,99 @@ local_configure_mongo() {
   ok "MongoDB configured (user: $MONGO_USER, db: $MONGO_DB)"
 }
 
+# ── Local: generate self-signed cert ──────────────────────────────────────────
+
+local_generate_cert() {
+  local CERT_DIR="/etc/ssl/ollama-chat"
+  local CERT_FILE="$CERT_DIR/cert.pem"
+  local KEY_FILE="$CERT_DIR/key.pem"
+
+  if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+    ok "TLS cert already exists at $CERT_DIR"
+    return
+  fi
+
+  log "Generating self-signed TLS certificate..."
+  mkdir -p "$CERT_DIR"
+  command -v openssl &>/dev/null || apt-get install -y -qq openssl
+
+  local LOCAL_IP HOSTNAME
+  LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+  HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+
+  openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout "$KEY_FILE" \
+    -out    "$CERT_FILE" \
+    -subj "/CN=$HOSTNAME" \
+    -addext "subjectAltName=DNS:$HOSTNAME,DNS:localhost,IP:$LOCAL_IP,IP:127.0.0.1" \
+    2>/dev/null
+
+  chmod 600 "$KEY_FILE"
+  ok "Self-signed cert generated for $HOSTNAME / $LOCAL_IP (10-year validity)"
+  warn "Browser will show 'unsafe' warning — click Advanced → Proceed to accept the self-signed cert."
+  warn "This is required for voice input (SpeechRecognition requires HTTPS)."
+}
+
 # ── Local: write nginx config ─────────────────────────────────────────────────
 
 local_configure_nginx() {
   hdr "Configuring nginx"
 
+  local TLS_BLOCK=""
+  local PORT_LINE="listen $LOCAL_WEB_PORT;"
+
+  if [[ "$LOCAL_ENABLE_HTTPS" == "True" ]]; then
+    local_generate_cert
+    TLS_BLOCK="
+server {
+    listen $LOCAL_HTTPS_PORT ssl http2;
+    server_name _;
+
+    ssl_certificate     /etc/ssl/ollama-chat/cert.pem;
+    ssl_certificate_key /etc/ssl/ollama-chat/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root /var/www/ollama-chat;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 600s;
+        proxy_buffering off;
+        client_max_body_size 50m;
+    }
+
+    location /uploads/ {
+        proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
+    }
+}
+"
+  fi
+
   cat > /etc/nginx/sites-available/ollama-chat <<NGINXCONF
 server {
-    listen $LOCAL_WEB_PORT;
+    $PORT_LINE
     server_name _;
 
     root /var/www/ollama-chat;
     index index.html;
 
-    # SPA fallback
     location / {
         try_files \$uri \$uri/ /index.html;
     }
 
-    # API proxy
     location /api/ {
         proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
         proxy_http_version 1.1;
@@ -262,21 +374,26 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_cache_bypass \$http_upgrade;
-        proxy_read_timeout 300s;
+        # Long timeout + no buffering so SSE streaming works
+        proxy_read_timeout 600s;
+        proxy_buffering off;
         client_max_body_size 50m;
     }
 
-    # Upload proxy
     location /uploads/ {
         proxy_pass http://127.0.0.1:$LOCAL_BACKEND_PORT;
     }
 }
+$TLS_BLOCK
 NGINXCONF
 
   ln -sf /etc/nginx/sites-available/ollama-chat /etc/nginx/sites-enabled/ollama-chat
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
   nginx -t && systemctl enable --now nginx && systemctl reload nginx
-  ok "nginx configured on port $LOCAL_WEB_PORT"
+  ok "nginx configured on port $LOCAL_WEB_PORT (HTTP)"
+  if [[ "$LOCAL_ENABLE_HTTPS" == "True" ]]; then
+    ok "nginx HTTPS listener on port $LOCAL_HTTPS_PORT"
+  fi
 }
 
 # ── Local: write backend systemd service ──────────────────────────────────────
@@ -324,6 +441,7 @@ SVCONF
 local_setup() {
   [[ "$(id -u)" -ne 0 ]] && err "Local setup must run as root (sudo ./run.sh setup)"
 
+  ensure_strong_jwt
   log "Starting local install on $(hostname)"
   local_install_deps
   local_configure_mongo
@@ -336,10 +454,14 @@ local_setup() {
   hdr "Setup complete"
   local LOCAL_IP
   LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-  ok "Web UI:    http://$LOCAL_IP:$LOCAL_WEB_PORT"
-  ok "Backend:   http://127.0.0.1:$LOCAL_BACKEND_PORT"
-  ok "Ollama:    http://127.0.0.1:$LOCAL_OLLAMA_PORT"
-  ok "MongoDB:   mongodb://127.0.0.1:27017/$MONGO_DB"
+  ok "Web UI (HTTP):  http://$LOCAL_IP:$LOCAL_WEB_PORT"
+  if [[ "$LOCAL_ENABLE_HTTPS" == "True" ]]; then
+    ok "Web UI (HTTPS): https://$LOCAL_IP:$LOCAL_HTTPS_PORT  ← use this for voice input"
+  fi
+  ok "Backend:        http://127.0.0.1:$LOCAL_BACKEND_PORT"
+  ok "Ollama:         http://127.0.0.1:$LOCAL_OLLAMA_PORT"
+  ok "MongoDB:        mongodb://127.0.0.1:27017/$MONGO_DB"
+  ok "API Docs:       http://$LOCAL_IP:$LOCAL_WEB_PORT/api/docs.json"
 }
 
 # ── Local: deploy backend ─────────────────────────────────────────────────────
@@ -636,8 +758,8 @@ cluster_check_deps() {
   done
 }
 
-remote_master() { $SSH $MASTER_IP "$@"; }
-remote_worker() { $SSH $WORKER_IP "$@"; }
+remote_master() { $SSH "$SSH_USER@$MASTER_IP" "$@"; }
+remote_worker() { $SSH "$SSH_USER@$WORKER_IP" "$@"; }
 
 OLLAMA_MANIFEST=$(cat <<EOF
 apiVersion: apps/v1
@@ -679,12 +801,14 @@ spec:
           mountPath: /root/.ollama
       volumes:
       - name: ollama-data
-        emptyDir: {}
+        hostPath:
+          path: /var/lib/ollama-data
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ollama-svc
+  name: ollama-service
 spec:
   type: NodePort
   selector:
@@ -713,6 +837,9 @@ spec:
       labels:
         app: mongodb
     spec:
+      # Pin to master so hostPath data survives pod rescheduling
+      nodeSelector:
+        kubernetes.io/hostname: $MASTER_HOSTNAME
       containers:
       - name: mongodb
         image: mongo:7
@@ -734,7 +861,9 @@ spec:
           mountPath: /data/db
       volumes:
       - name: mongo-data
-        emptyDir: {}
+        hostPath:
+          path: /var/lib/ollama-mongo-data
+          type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -819,9 +948,9 @@ spec:
         - name: PORT
           value: "5000"
         - name: OLLAMA_URL
-          value: "http://ollama-svc.default.svc.cluster.local:11434/api/chat"
+          value: "http://ollama-service.default.svc.cluster.local:11434/api/chat"
         - name: OLLAMA_BASE
-          value: "http://ollama-svc.default.svc.cluster.local:11434"
+          value: "http://ollama-service.default.svc.cluster.local:11434"
         - name: MONGO_URI
           value: "mongodb://$MONGO_USER:$MONGO_PASS@mongodb.default.svc.cluster.local:27017/$MONGO_DB?authSource=admin"
         - name: JWT_SECRET
@@ -903,7 +1032,13 @@ cluster_build_and_push_image() {
 
 cluster_setup() {
   cluster_check_deps
+  ensure_strong_jwt
   log "Setting up Ollama Cluster on $MASTER_IP + $WORKER_IP"
+
+  log "Creating persistent storage directories on both nodes..."
+  remote_master "mkdir -p /var/lib/ollama-data /var/lib/ollama-mongo-data"
+  $SSH "$SSH_USER@$WORKER_IP" "mkdir -p /var/lib/ollama-data" || true
+  ok "Persistent dirs ready (Ollama models + MongoDB data survive pod restarts)"
 
   log "Installing K3s on master ($MASTER_IP)..."
   remote_master "curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -" || true
@@ -912,7 +1047,7 @@ cluster_setup() {
   ok "K3s master ready"
 
   log "Installing K3s agent on worker ($WORKER_IP)..."
-  $SSH $WORKER_IP "curl -sfL https://get.k3s.io | K3S_URL=https://$MASTER_IP:6443 K3S_TOKEN=$K3S_TOKEN sh -" || true
+  $SSH "$SSH_USER@$WORKER_IP" "curl -sfL https://get.k3s.io | K3S_URL=https://$MASTER_IP:6443 K3S_TOKEN=$K3S_TOKEN sh -" || true
   sleep 15
   remote_master "k3s kubectl wait --for=condition=Ready node --all --timeout=120s" || warn "Worker may take more time to join"
   ok "Worker joined cluster"
@@ -952,7 +1087,7 @@ cluster_uninstall() {
   [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 0; }
 
   remote_master "k3s-uninstall.sh 2>/dev/null || true"
-  $SSH $WORKER_IP "k3s-agent-uninstall.sh 2>/dev/null || true"
+  $SSH "$SSH_USER@$WORKER_IP" "k3s-agent-uninstall.sh 2>/dev/null || true"
   remote_master "pkill -f 'node server.js' 2>/dev/null || true"
   remote_master "rm -rf /var/www/html/* && systemctl restart nginx 2>/dev/null || true"
   rm -f "$MODE_FILE"

@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.local
+.env.production
+
+# Local mode state
+.run-mode
+
+# Build artifacts
+chat-app/frontend/build/
+chat-app/frontend/node_modules/
+chat-app/backend/node_modules/
+chat-app/backend/uploads/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Generated files
+/tmp/*.tar

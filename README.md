@@ -224,12 +224,29 @@ Docker images are built locally, saved as `.tar`, and imported into **both** nod
 ## Features
 
 ### Chat
+- **Real token-by-token streaming** via Server-Sent Events (backend → frontend)
 - Multi-model selector grouped by family (Qwen3, Qwen2.5, Gemma3, DeepSeek-R1, etc.)
 - Full conversation history sent to Ollama on every message
 - System prompt, temperature, top_p, max_tokens — all respected
 - File/image upload (PDF text extraction + image vision)
 - Vision routing: gemma3:4b and gemma3:12b handle images natively; other models auto-route to gemma3:12b
-- Voice input (HTTPS required for browser SpeechRecognition API)
+- Voice input (HTTPS required for browser SpeechRecognition API — local mode now provides HTTPS by default)
+- **Conversation export** to JSON or Markdown via the topbar "↓ export" menu
+
+### Security
+- **Rate limiting** on all auth endpoints (10 attempts / 15 min; OTP requests limited to 5 / hour per IP)
+- **Auto-generated strong JWT secret** on first `setup` (saved to `.env`, gitignored)
+- Self-signed TLS cert generated automatically in local mode
+- Secrets can be overridden via `.env` file (template at `.env.example`)
+
+### Models tab (admin)
+- **Pull new models** with live progress bar streamed from `ollama pull`
+- Delete models to free disk space
+- View installed models with sizes
+
+### Storage (cluster mode)
+- MongoDB pinned to master node with `hostPath` volume — data survives pod restarts
+- Ollama models stored on `hostPath` on each node — no re-pulling after pod restart
 
 ### Auth
 - JWT login with configurable expiry
@@ -245,7 +262,8 @@ Docker images are built locally, saved as `.tar`, and imported into **both** nod
 - View all users and their conversations
 
 ### API Docs tab
-- All backend endpoints documented in the UI
+- **Auto-generated from backend** (via `swagger-jsdoc` from JSDoc on each route)
+- Live OpenAPI spec at `/api/docs.json`
 - curl examples, payload schemas, copy buttons, search/filter
 
 ### Cluster view
@@ -264,13 +282,30 @@ ollama/
 ├── README.md
 └── chat-app/
     ├── backend/
-    │   ├── server.js         ← Express API (auth, chat, admin, cluster status)
+    │   ├── server.js         ← Express API (auth, chat, admin, cluster, streaming)
     │   ├── package.json
     │   └── Dockerfile
     └── frontend/
         ├── src/
-        │   ├── App.tsx       ← React app (Login, Chat, Cluster, Models, Admin, API Docs)
-        │   └── App.css       ← Design system (CSS variables, dark theme)
+        │   ├── App.tsx                  ← Orchestrator (state + routing)
+        │   ├── App.css                  ← Design system (CSS variables)
+        │   ├── types.ts                 ← Shared TypeScript interfaces
+        │   ├── icons.tsx                ← SVG icon components
+        │   ├── lib/helpers.tsx          ← genId, renderContent, formatBytes, etc.
+        │   └── components/
+        │       ├── LoginPage.tsx
+        │       ├── ForgotPasswordPage.tsx   (3-step OTP flow)
+        │       ├── TopBar.tsx
+        │       ├── Sidebar.tsx
+        │       ├── EmptyState.tsx
+        │       ├── Message.tsx              (incl. MessageRender)
+        │       ├── Composer.tsx
+        │       ├── ClusterView.tsx
+        │       ├── ModelsView.tsx           (with pull progress)
+        │       ├── AdminView.tsx
+        │       ├── ApiDocsView.tsx          (live from /api/docs.json)
+        │       ├── SettingsDrawer.tsx
+        │       └── MobileOverlay.tsx
         └── public/
             └── index.html
 ```
@@ -279,19 +314,29 @@ ollama/
 
 ## SMTP / Email (optional)
 
-Configure `backend.smtp` in `config.json` for forgot-password OTP emails:
+The forgot-password flow sends a 6-digit OTP to the user's email. Configure via either:
 
-```json
-"smtp": {
-  "host": "smtp.gmail.com",
-  "port": 587,
-  "user": "you@gmail.com",
-  "pass": "app-password",
-  "from": "noreply@yourapp.com"
-}
+**Option 1: `.env` file (recommended — gitignored)**
+```bash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASS=app-specific-password
+SMTP_FROM=noreply@yourdomain.com
 ```
 
-Leave `host` empty during development — the OTP prints to the backend log instead.
+**Option 2: `config.json → backend.smtp`** (committed to git — be careful)
+```json
+"smtp": { "host": "smtp.gmail.com", "port": 587, "user": "you@gmail.com", "pass": "app-password", "from": "noreply@yourapp.com" }
+```
+
+**Dev mode (no SMTP configured):**
+- The OTP is **printed loudly to the backend log** (look for `╔════ PASSWORD RESET OTP ════╗`)
+- The OTP is also **returned in the `/api/auth/forgot-password` response** (`devCode` field)
+- The UI displays the code in a "DEV MODE" banner with an "Auto-fill →" button on the OTP step
+- This means the forgot-password flow works end-to-end without any SMTP server — useful for self-hosted setups
+
+At backend boot, the SMTP connection is verified via `transporter.verify()`. Any connection failure is logged immediately (`[SMTP] ✗ Connection failed: …`) so you can debug without waiting for the first OTP request.
 
 ---
 

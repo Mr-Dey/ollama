@@ -67,8 +67,10 @@
   },
   "local": {
     "web_port": 8080,
+    "https_port": 8443,
     "ollama_port": 11434,
-    "backend_port": 5000
+    "backend_port": 5000,
+    "enable_https": true
   },
   "users": [
     {
